@@ -1,0 +1,19 @@
+{
+  "name": "mut-vcs",
+  "version": "0.1.0",
+  "description": "Managed Unified Tree — version management for AI agents",
+  "keywords": ["git", "version-control", "ai-agents", "vcs", "mut"],
+  "license": "MIT",
+  "bin": {
+    "mut": "./bin/mut.js",
+    "mut-server": "./bin/mut-server.js"
+  },
+  "files": [
+    "bin/",
+    "mut/"
+  ],
+  "engines": {
+    "node": ">=14"
+  },
+  "os": ["darwin", "linux", "win32"]
+}

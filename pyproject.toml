@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.backends._legacy:_Backend"
+
+[project]
+name = "mut"
+version = "0.1.0"
+description = "Managed Unified Tree — version management for AI agents"
+requires-python = ">=3.9"
+license = {text = "MIT"}
+
+[project.scripts]
+mut = "mut.cli:main"
+mut-server = "mut.server.__main__:main"
+
+[tool.setuptools.packages.find]
+include = ["mut*"]
