@@ -27,6 +27,7 @@ SERVER_ROOT_FILE = "root"          # global root tree hash
 SERVER_CONFIG_FILE = "config.json"
 SECRET_KEY_FILE = "secret.key"
 SERVER_AUDIT_DIR = "audit"
+SERVER_INVITES_DIR = "invites"
 
 BUILTIN_IGNORE = {".mut", ".mut-server", ".git", ".DS_Store", "__pycache__", ".env", "node_modules", ".venv"}
 

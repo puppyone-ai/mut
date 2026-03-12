@@ -12,6 +12,8 @@ from mut.foundation.config import (
 )
 from mut.foundation.fs import read_text, write_text
 from mut.foundation.transport import post_push, post_negotiate
+from mut.core import manifest as manifest_mod
+from mut.core.diff import diff_manifests
 
 
 def push(repo: MutRepo) -> dict:
@@ -27,6 +29,15 @@ def push(repo: MutRepo) -> dict:
 
     unpushed = repo.snapshots.get_unpushed()
     if not unpushed:
+        old_manifest = manifest_mod.load(repo.mut_root)
+        cur_manifest = manifest_mod.generate(repo.workdir, repo.ignore)
+        dirty = diff_manifests(old_manifest, cur_manifest)
+        if dirty:
+            return {
+                "status": "dirty",
+                "pushed": 0,
+                "uncommitted": len(dirty),
+            }
         return {"status": "up-to-date", "pushed": 0}
 
     remote_head_path = repo.mut_root / REMOTE_HEAD_FILE

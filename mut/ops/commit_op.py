@@ -8,12 +8,16 @@
 from mut.ops.repo import MutRepo
 from mut.core import tree as tree_mod
 from mut.core import manifest as manifest_mod
-from mut.foundation.config import HEAD_FILE
+from mut.foundation.config import HEAD_FILE, load_config
 from mut.foundation.fs import write_text
 
 
-def commit(repo: MutRepo, message: str, who: str = "anonymous"):
+def commit(repo: MutRepo, message: str, who: str = None):
     repo.check_init()
+
+    if who is None:
+        cfg = load_config(repo.mut_root)
+        who = cfg.get("agent_id", "anonymous")
 
     root_hash = tree_mod.scan_dir(repo.store, repo.workdir, repo.ignore)
     snap = repo.snapshots.create(root_hash, who, message, pushed=False)
