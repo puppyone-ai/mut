@@ -79,6 +79,8 @@ class MutHandler(BaseHTTPRequestHandler):
             self._handle_pull()
         elif self.path == "/negotiate":
             self._handle_negotiate()
+        elif self.path.startswith("/invite/"):
+            self._handle_register()
         else:
             self._send_error(404, f"unknown endpoint: {self.path}")
 
@@ -118,6 +120,7 @@ class MutHandler(BaseHTTPRequestHandler):
         })
 
         self._send_json({
+            "project": repo.get_project_name(),
             "files": files_b64,
             "objects": objects_b64,
             "history": history,
@@ -302,6 +305,30 @@ class MutHandler(BaseHTTPRequestHandler):
             "files": files_b64,
             "objects": objects_b64,
             "history": history,
+        })
+
+    # ── Register (via invite) ─────────────────────
+
+    def _handle_register(self):
+        invite_id = self.path.split("/invite/", 1)[1].strip("/")
+        if not invite_id:
+            self._send_error(400, "missing invite ID")
+            return
+        repo = self.server_repo
+        try:
+            agent_id, token = repo.use_invite(invite_id)
+        except ValueError as e:
+            self._send_error(403, str(e))
+            return
+        scope = repo.get_scope_for_agent(agent_id)
+        self._send_json({
+            "agent_id": agent_id,
+            "token": token,
+            "project": repo.get_project_name(),
+            "scope": {
+                "path": scope["path"],
+                "mode": scope.get("mode", "rw"),
+            },
         })
 
     # ── Logging ───────────────────────────────────

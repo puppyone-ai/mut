@@ -6,6 +6,7 @@
 """
 
 import base64
+import json
 from pathlib import Path
 
 from mut.foundation.config import (
@@ -19,20 +20,41 @@ from mut.core import manifest as manifest_mod
 from mut.ops.repo import MutRepo
 
 
-def clone(server_url: str, token: str, workdir: str = ".") -> MutRepo:
-    """Clone a scope from the server into workdir."""
-    root = Path(workdir).resolve()
-    mut = root / MUT_DIR
+def _extract_agent_id(token: str) -> str:
+    """Read agent ID from token payload without signature verification."""
+    try:
+        payload_b64 = token.split(".")[1]
+        padding = 4 - len(payload_b64) % 4
+        if padding != 4:
+            payload_b64 += "=" * padding
+        payload = json.loads(base64.urlsafe_b64decode(payload_b64))
+        return payload.get("agent", "anonymous")
+    except Exception:
+        return "anonymous"
 
-    if mut.exists():
-        raise FileExistsError(f"already initialized: {mut}")
 
+def clone(server_url: str, token: str, workdir: str = None) -> MutRepo:
+    """Clone a scope from the server into workdir.
+
+    If workdir is None, the project name returned by the server is used
+    as the directory name (like ``git clone`` derives it from the URL).
+    """
     resp = post_clone(server_url, token)
 
     files_b64 = resp["files"]
     objects_b64 = resp["objects"]
     version = resp["version"]
     scope_info = resp["scope"]
+    project_name = resp.get("project", "project")
+
+    if workdir is None:
+        workdir = project_name
+
+    root = Path(workdir).resolve()
+    mut = root / MUT_DIR
+
+    if mut.exists():
+        raise FileExistsError(f"already initialized: {mut}")
 
     mkdir_p(root)
     for rel_path, b64data in files_b64.items():
@@ -48,9 +70,12 @@ def clone(server_url: str, token: str, workdir: str = ".") -> MutRepo:
         mkdir_p(obj_path.parent)
         obj_path.write_bytes(base64.b64decode(b64data))
 
+    agent_id = _extract_agent_id(token)
     write_json(mut / CONFIG_FILE, {
         "server": server_url,
         "scope": scope_info["path"],
+        "project": project_name,
+        "agent_id": agent_id,
     })
     write_text(mut / TOKEN_FILE, token)
 

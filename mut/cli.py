@@ -37,7 +37,19 @@ from mut.ops import (
     push_op,
     pull_op,
     stats_op,
+    register_op,
 )
+
+
+def cmd_register(args):
+    result = register_op.register(args.invite_url)
+    print(f"Registered with {result['server']}")
+    print(f"  agent:   {result['agent_id']}")
+    print(f"  project: {result['project']}")
+    print(f"  scope:   {result['scope'].get('path', '/')}")
+    print(f"")
+    print(f"Credentials saved. You can now clone:")
+    print(f"  mut clone {result['server']}")
 
 
 def cmd_init(args):
@@ -46,14 +58,37 @@ def cmd_init(args):
 
 
 def cmd_clone(args):
-    repo = clone_op.clone(args.url, args.token, args.dir)
+    url = args.url
+    token = args.token
+
+    if "/invite/" in url:
+        result = register_op.register(url)
+        print(f"Registered with {result['server']}")
+        print(f"  agent: {result['agent_id']}")
+        url = result["server"]
+        from mut.foundation.credentials import get_credential
+        cred = get_credential(url)
+        token = cred["token"]
+
+    if not token:
+        from mut.foundation.credentials import get_credential
+        cred = get_credential(url)
+        if cred:
+            token = cred["token"]
+        else:
+            print("fatal: no --token provided and no stored credentials for this server.", file=sys.stderr)
+            print("  Run 'mut clone <invite-url>' to register, or pass --token.", file=sys.stderr)
+            sys.exit(1)
+
+    workdir = args.dir if args.dir else None
+    repo = clone_op.clone(url, token, workdir)
     print(f"Cloned into {repo.workdir}")
-    print(f"  scope: {args.url}")
 
 
 def cmd_commit(args):
     repo = MutRepo(".")
-    snap = commit_op.commit(repo, args.message, args.who)
+    who = args.who if args.who else None
+    snap = commit_op.commit(repo, args.message, who)
     if snap is None:
         print("nothing to commit, working directory unchanged")
     else:
@@ -129,6 +164,10 @@ def cmd_tree(args):
 def cmd_push(args):
     repo = MutRepo(".")
     result = push_op.push(repo)
+    if result["status"] == "dirty":
+        print(f"You have {result['uncommitted']} uncommitted change(s).")
+        print(f"  Run 'mut commit -m \"...\"' first, then push.")
+        return
     if result["status"] == "up-to-date":
         print("Everything up-to-date")
     else:
@@ -169,14 +208,18 @@ def main():
 
     sub.add_parser("init", help="Initialize a .mut/ repository")
 
+    p_register = sub.add_parser("register", help="Register with a server using an invite URL")
+    p_register.add_argument("invite_url", help="Invite URL, e.g. http://server:9742/invite/abc123")
+
     p_clone = sub.add_parser("clone", help="Clone scope from server")
     p_clone.add_argument("url", help="Server URL, e.g. http://localhost:9742")
-    p_clone.add_argument("--token", required=True, help="Auth token")
-    p_clone.add_argument("--dir", default=".", help="Target directory (default: .)")
+    p_clone.add_argument("--token", default="", help="Auth token (auto from credentials if omitted)")
+    p_clone.add_argument("dir", nargs="?", default="",
+                         help="Target directory (default: auto from project name)")
 
     p_commit = sub.add_parser("commit", help="Snapshot the working directory")
     p_commit.add_argument("-m", "--message", required=True, help="Commit message")
-    p_commit.add_argument("-w", "--who", default="anonymous", help="Agent ID")
+    p_commit.add_argument("-w", "--who", default="", help="Agent ID (auto from config if omitted)")
 
     sub.add_parser("log", help="Show snapshot history")
     sub.add_parser("status", help="Show changes since last snapshot")
@@ -208,6 +251,7 @@ def main():
 
     dispatch = {
         "init": cmd_init,
+        "register": cmd_register,
         "clone": cmd_clone,
         "commit": cmd_commit,
         "log": cmd_log,

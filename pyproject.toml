@@ -15,3 +15,7 @@ mut-server = "mut.server.__main__:main"
 
 [tool.setuptools.packages.find]
 include = ["mut*"]
+exclude = ["tests*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

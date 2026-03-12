@@ -35,6 +35,24 @@ def cmd_add_scope(args):
         print(f"  exclude: {exclude}")
 
 
+def cmd_create_invite(args):
+    repo = ServerRepo(args.path)
+    repo.check_init()
+    exclude = [e.strip() for e in args.exclude.split(",")] if args.exclude else []
+    invite = repo.create_invite(args.scope_path, args.mode, exclude, args.max_uses)
+    host = args.host or "localhost"
+    port = args.port or 9742
+    url = f"http://{host}:{port}/invite/{invite['id']}"
+    print(f"Invite created:")
+    print(f"  scope: {invite['scope_path']} ({invite['mode']})")
+    print(f"  max uses: {invite['max_uses'] or 'unlimited'}")
+    print(f"")
+    print(f"  {url}")
+    print(f"")
+    print(f"Share this URL. Agents can register with:")
+    print(f"  mut register {url}")
+
+
 def cmd_issue_token(args):
     repo = ServerRepo(args.path)
     repo.check_init()
@@ -69,6 +87,16 @@ def main():
     p_scope.add_argument("--mode", default="rw", help="r or rw (default: rw)")
     p_scope.add_argument("--exclude", default="", help="Comma-separated excluded paths")
 
+    p_invite = sub.add_parser("create-invite", help="Create an invite URL for agents")
+    p_invite.add_argument("path", help="Server repo directory")
+    p_invite.add_argument("--scope-path", required=True, help="Path prefix, e.g. /src/")
+    p_invite.add_argument("--mode", default="rw", help="r or rw (default: rw)")
+    p_invite.add_argument("--exclude", default="", help="Comma-separated excluded paths")
+    p_invite.add_argument("--max-uses", type=int, default=0,
+                          help="Max registrations (0=unlimited)")
+    p_invite.add_argument("--host", default="", help="Server hostname for URL")
+    p_invite.add_argument("--port", type=int, default=0, help="Server port for URL")
+
     p_token = sub.add_parser("issue-token", help="Issue a token for an agent")
     p_token.add_argument("path", help="Server repo directory")
     p_token.add_argument("--agent", required=True, help="Agent ID")
@@ -88,6 +116,7 @@ def main():
     dispatch = {
         "init": cmd_init,
         "add-scope": cmd_add_scope,
+        "create-invite": cmd_create_invite,
         "issue-token": cmd_issue_token,
         "serve": cmd_serve,
     }

@@ -1,0 +1,9 @@
+{
+  "id": "scope-src",
+  "path": "/src/",
+  "exclude": [],
+  "agents": [
+    "agent-1"
+  ],
+  "mode": "rw"
+}

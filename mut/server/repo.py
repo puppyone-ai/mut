@@ -23,7 +23,7 @@ from mut.foundation.config import (
     SERVER_SCOPES_DIR, SERVER_HISTORY_DIR,
     SERVER_LOCKS_DIR, SERVER_LATEST_FILE, SERVER_ROOT_FILE,
     SERVER_CONFIG_FILE, SECRET_KEY_FILE, SERVER_AUDIT_DIR,
-    BUILTIN_IGNORE,
+    SERVER_INVITES_DIR, BUILTIN_IGNORE,
 )
 from mut.foundation.fs import (
     read_json, write_json, write_text, mkdir_p,
@@ -51,6 +51,7 @@ class ServerRepo:
         self.history = HistoryManager(self.meta / SERVER_HISTORY_DIR)
         self.audit = AuditLog(self.meta / SERVER_AUDIT_DIR)
         self.locks_dir = self.meta / SERVER_LOCKS_DIR
+        self.invites_dir = self.meta / SERVER_INVITES_DIR
 
     # ── Init ──────────────────────────────────────
 
@@ -67,6 +68,7 @@ class ServerRepo:
         mkdir_p(meta / SERVER_HISTORY_DIR)
         mkdir_p(meta / SERVER_LOCKS_DIR)
         mkdir_p(meta / SERVER_AUDIT_DIR)
+        mkdir_p(meta / SERVER_INVITES_DIR)
 
         write_json(meta / SERVER_CONFIG_FILE, {"project": project_name})
 
@@ -82,6 +84,10 @@ class ServerRepo:
         if not self.meta.exists():
             raise FileNotFoundError("not a mut server repo (run 'mut-server init' first)")
 
+    def get_project_name(self) -> str:
+        cfg = read_json(self.meta / SERVER_CONFIG_FILE)
+        return cfg.get("project", "project")
+
     # ── Secret & Token ────────────────────────────
 
     def get_secret(self) -> str:
@@ -94,6 +100,58 @@ class ServerRepo:
         return sign_token(
             self.get_secret(), agent_id, scope["path"], scope["mode"], expiry_seconds
         )
+
+    # ── Invites ────────────────────────────────────
+
+    def create_invite(self, scope_path: str, mode: str = "rw",
+                      exclude: list = None, max_uses: int = 0) -> dict:
+        """Create an invite. max_uses=0 means unlimited."""
+        from datetime import datetime, timezone
+        invite_id = secrets.token_urlsafe(12)
+        invite = {
+            "id": invite_id,
+            "scope_path": scope_path,
+            "mode": mode,
+            "exclude": exclude or [],
+            "max_uses": max_uses,
+            "used": 0,
+            "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        }
+        mkdir_p(self.invites_dir)
+        write_json(self.invites_dir / f"{invite_id}.json", invite)
+        return invite
+
+    def use_invite(self, invite_id: str) -> tuple[str, str]:
+        """Consume an invite: create scope + agent, return (agent_id, token).
+
+        Raises ValueError if invite is invalid or exhausted.
+        """
+        path = self.invites_dir / f"{invite_id}.json"
+        if not path.exists():
+            raise ValueError("invalid invite")
+
+        invite = read_json(path)
+        if invite["max_uses"] > 0 and invite["used"] >= invite["max_uses"]:
+            raise ValueError("invite has been fully used")
+
+        agent_id = f"agent-{secrets.token_hex(4)}"
+        scope_id = f"scope-{secrets.token_hex(4)}"
+
+        self.add_scope(
+            scope_id, invite["scope_path"], [agent_id],
+            invite["mode"], invite["exclude"],
+        )
+        token = self.issue_token(agent_id)
+
+        invite["used"] += 1
+        write_json(path, invite)
+
+        self.record_audit("invite_used", agent_id, {
+            "invite_id": invite_id,
+            "scope_path": invite["scope_path"],
+        })
+
+        return agent_id, token
 
     # ── Delegated scope access ────────────────────
 
