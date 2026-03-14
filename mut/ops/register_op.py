@@ -5,13 +5,13 @@
 3. Save credentials locally for future clone/push/pull
 """
 
-import json
-import urllib.request
-import urllib.error
+from __future__ import annotations
+
 from urllib.parse import urlparse
 
 from mut.foundation.error import NetworkError
 from mut.foundation.credentials import save_credential
+from mut.foundation.transport import _make_request
 
 
 def register(invite_url: str) -> dict:
@@ -19,24 +19,7 @@ def register(invite_url: str) -> dict:
     parsed = urlparse(invite_url)
     server_url = f"{parsed.scheme}://{parsed.hostname}:{parsed.port or 80}"
 
-    req = urllib.request.Request(
-        invite_url,
-        data=b"{}",
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            data = json.loads(resp.read().decode())
-    except urllib.error.HTTPError as e:
-        try:
-            detail = json.loads(e.read().decode())
-            msg = detail.get("error", str(e))
-        except Exception:
-            msg = str(e)
-        raise NetworkError(f"registration failed ({e.code}): {msg}")
-    except urllib.error.URLError as e:
-        raise NetworkError(f"cannot reach server: {e.reason}")
+    data = _make_request(invite_url, data={})
 
     save_credential(
         server_url,

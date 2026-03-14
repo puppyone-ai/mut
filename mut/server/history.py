@@ -1,9 +1,12 @@
 """Server-side version history management."""
 
+from __future__ import annotations
+
 from datetime import datetime, timezone
 from pathlib import Path
 
 from mut.foundation.fs import read_json, write_json, write_text
+from mut.core.protocol import normalize_path
 
 
 class HistoryManager:
@@ -32,8 +35,8 @@ class HistoryManager:
 
     def record(self, version: int, who: str, message: str,
                scope_path: str, changes: list,
-               conflicts: list = None, root_hash: str = ""):
-        entry = {
+               conflicts: list | None = None, root_hash: str = ""):
+        entry: dict = {
             "id": version,
             "who": who,
             "time": datetime.now(timezone.utc).isoformat(timespec="seconds"),
@@ -50,42 +53,50 @@ class HistoryManager:
             ]
         write_json(self.dir / f"{version:06d}.json", entry)
 
-    def get_since(self, since_version: int, scope_path: str = None) -> list:
+    def get_since(self, since_version: int, scope_path: str | None = None) -> list:
         """Return history entries after since_version.
 
         If scope_path is given, only entries whose scope overlaps
         with scope_path are included (prevents cross-scope info leak).
         """
-        result = []
+        result: list[dict] = []
         latest = self.get_latest_version()
-        norm_scope = scope_path.strip("/") if scope_path else None
+        norm_scope = normalize_path(scope_path) if scope_path else None
+
         for v in range(since_version + 1, latest + 1):
-            path = self.dir / f"{v:06d}.json"
-            if path.exists():
-                entry = read_json(path)
-                if norm_scope is not None:
-                    entry_scope = entry.get("scope", "/").strip("/")
-                    if entry_scope and norm_scope and entry_scope != norm_scope:
-                        if not (entry_scope.startswith(norm_scope + "/") or
-                                norm_scope.startswith(entry_scope + "/")):
-                            continue
-                    entry = self._redact_for_scope(entry, norm_scope)
-                result.append(entry)
+            entry = self.get_entry(v)
+            if entry is None:
+                continue
+            if norm_scope is not None:
+                if not _scopes_overlap(entry.get("scope", "/"), norm_scope):
+                    continue
+                entry = _redact_for_scope(entry, norm_scope)
+            result.append(entry)
         return result
 
-    @staticmethod
-    def _redact_for_scope(entry: dict, scope: str) -> dict:
-        """Strip change details for paths outside the requesting scope."""
-        if "changes" in entry:
-            entry = dict(entry)
-            entry["changes"] = [
-                c for c in entry["changes"]
-                if c["path"].strip("/").startswith(scope)
-            ]
-        return entry
-
-    def get_entry(self, version: int) -> dict:
+    def get_entry(self, version: int) -> dict | None:
         path = self.dir / f"{version:06d}.json"
         if path.exists():
             return read_json(path)
         return None
+
+
+def _scopes_overlap(entry_scope: str, requesting_scope: str) -> bool:
+    """Check if two scope paths overlap (one is prefix of the other)."""
+    es = normalize_path(entry_scope)
+    rs = requesting_scope  # already normalized by caller
+    if not es or not rs:
+        return True
+    return (es.startswith(rs + "/") or rs.startswith(es + "/") or es == rs)
+
+
+def _redact_for_scope(entry: dict, scope: str) -> dict:
+    """Strip change details for paths outside the requesting scope."""
+    if "changes" not in entry:
+        return entry
+    redacted = dict(entry)
+    redacted["changes"] = [
+        c for c in entry["changes"]
+        if normalize_path(c["path"]).startswith(scope)
+    ]
+    return redacted

@@ -6,6 +6,8 @@
 4. Update working directory, objects, snapshots, manifest, HEAD, REMOTE_HEAD
 """
 
+from __future__ import annotations
+
 import base64
 
 from mut.ops.repo import MutRepo
@@ -14,7 +16,7 @@ from mut.foundation.config import (
 )
 from mut.foundation.error import DirtyWorkdirError
 from mut.foundation.fs import read_text, write_text, mkdir_p
-from mut.foundation.transport import post_pull
+from mut.foundation.transport import MutClient
 from mut.core import tree as tree_mod
 from mut.core import manifest as manifest_mod
 from mut.core.diff import diff_manifests
@@ -41,12 +43,13 @@ def pull(repo: MutRepo, force: bool = False) -> dict:
             )
 
     token = read_text(repo.mut_root / TOKEN_FILE)
+    client = MutClient(server_url, token)
 
     remote_head_path = repo.mut_root / REMOTE_HEAD_FILE
     since_version = int(read_text(remote_head_path)) if remote_head_path.exists() else 0
 
     have_hashes = repo.store.all_hashes()
-    resp = post_pull(server_url, token, since_version, have_hashes=have_hashes)
+    resp = client.pull(since_version, have_hashes=have_hashes)
 
     if resp["status"] == "up-to-date":
         return {"status": "up-to-date", "pulled": 0}
@@ -56,8 +59,7 @@ def pull(repo: MutRepo, force: bool = False) -> dict:
     server_version = resp.get("version", since_version)
 
     for h, b64data in objects_b64.items():
-        data = base64.b64decode(b64data)
-        repo.store.put(data)
+        repo.store.put(base64.b64decode(b64data))
 
     server_paths = set(files_b64.keys())
     for rel_path, b64data in files_b64.items():
@@ -65,16 +67,7 @@ def pull(repo: MutRepo, force: bool = False) -> dict:
         mkdir_p(target.parent)
         target.write_bytes(base64.b64decode(b64data))
 
-    old_manifest = manifest_mod.load(repo.mut_root)
-    for old_path in old_manifest:
-        if old_path not in server_paths:
-            victim = repo.workdir / old_path
-            if victim.exists():
-                victim.unlink()
-                parent = victim.parent
-                while parent != repo.workdir and parent.exists() and not any(parent.iterdir()):
-                    parent.rmdir()
-                    parent = parent.parent
+    _remove_deleted_files(repo, server_paths)
 
     root_hash = tree_mod.scan_dir(repo.store, repo.workdir, repo.ignore)
 
@@ -93,3 +86,21 @@ def pull(repo: MutRepo, force: bool = False) -> dict:
         "pulled": len(files_b64),
         "server_version": server_version,
     }
+
+
+def _remove_deleted_files(repo: MutRepo, server_paths: set[str]) -> None:
+    """Remove local files that no longer exist on the server."""
+    old_manifest = manifest_mod.load(repo.mut_root)
+    for old_path in old_manifest:
+        if old_path not in server_paths:
+            victim = repo.workdir / old_path
+            if victim.exists():
+                victim.unlink()
+                _clean_empty_parents(victim.parent, repo.workdir)
+
+
+def _clean_empty_parents(parent, stop_at) -> None:
+    """Remove empty parent directories up to stop_at."""
+    while parent != stop_at and parent.exists() and not any(parent.iterdir()):
+        parent.rmdir()
+        parent = parent.parent
