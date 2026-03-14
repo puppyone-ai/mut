@@ -4,7 +4,7 @@ import time
 import pytest
 
 from mut.core.auth import sign_token, verify_token
-from mut.foundation.error import PermissionDenied
+from mut.foundation.error import AuthenticationError
 
 
 SECRET = "test-secret-key-1234567890abcdef"
@@ -20,19 +20,19 @@ def test_sign_and_verify():
 
 def test_wrong_secret():
     token = sign_token(SECRET, "agent-A", "/src/", "rw")
-    with pytest.raises(PermissionDenied, match="invalid token signature"):
+    with pytest.raises(AuthenticationError, match="invalid token signature"):
         verify_token(token, "wrong-secret")
 
 
 def test_malformed_token():
-    with pytest.raises(PermissionDenied, match="malformed"):
+    with pytest.raises(AuthenticationError, match="malformed"):
         verify_token("not.a.valid.token.format", SECRET)
 
 
 def test_expired_token():
     token = sign_token(SECRET, "agent-A", "/src/", "rw", expiry_seconds=1)
     time.sleep(1.5)
-    with pytest.raises(PermissionDenied, match="expired"):
+    with pytest.raises(AuthenticationError, match="expired"):
         verify_token(token, SECRET)
 
 

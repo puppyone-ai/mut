@@ -63,7 +63,17 @@ def push(repo: MutRepo) -> dict:
     server_version = resp.get("version", base_version)
     latest_id = unpushed[-1]["id"]
     repo.snapshots.mark_pushed(latest_id)
-    write_text(remote_head_path, str(server_version))
+
+    merged = resp.get("merged", False)
+    others_pushed = server_version > base_version + 1
+
+    if merged or others_pushed:
+        # Our local working directory doesn't reflect the full server state.
+        # Keep REMOTE_HEAD at base_version so the next pull fetches
+        # the complete server state including other agents' changes.
+        write_text(remote_head_path, str(base_version))
+    else:
+        write_text(remote_head_path, str(server_version))
 
     result = {
         "status": "pushed",
@@ -71,7 +81,7 @@ def push(repo: MutRepo) -> dict:
         "latest_id": latest_id,
         "server_version": server_version,
     }
-    if resp.get("merged"):
+    if merged:
         result["merged"] = True
         result["conflicts"] = resp.get("conflicts", 0)
     return result

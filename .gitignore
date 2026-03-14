@@ -5,6 +5,7 @@ __pycache__/
 dist/
 build/
 .eggs/
+.mut/
 
 # Node
 node_modules/

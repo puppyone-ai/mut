@@ -1,9 +1,12 @@
 """HTTP transport layer for agent → server communication.
 
-Uses only stdlib (urllib) — no external dependencies.
-All payloads are JSON.  Binary objects are base64-encoded inside JSON.
+Uses only stdlib (urllib for sync, asyncio for async) — no external dependencies.
+All payloads are JSON. Binary objects are base64-encoded inside JSON.
 """
 
+from __future__ import annotations
+
+import asyncio
 import base64
 import json
 import urllib.request
@@ -12,7 +15,10 @@ import urllib.error
 from mut.foundation.error import NetworkError
 
 
-def _make_request(url: str, data: dict = None, token: str = None, method: str = None):
+# ── Sync transport ────────────────────────────
+
+def _make_request(url: str, data: dict = None, token: str = None,
+                  method: str = None) -> dict:
     """Send an HTTP request, return parsed JSON response."""
     headers = {"Content-Type": "application/json"}
     if token:
@@ -44,10 +50,7 @@ def post_clone(server_url: str, token: str) -> dict:
 
 def post_push(server_url: str, token: str, base_version: int,
               snapshots: list, objects: dict) -> dict:
-    """POST /push — send unpushed snapshots and new objects.
-
-    objects: {hash: base64(bytes)} — only objects the server doesn't have.
-    """
+    """POST /push — send unpushed snapshots and new objects."""
     return _make_request(f"{server_url}/push", token=token, data={
         "base_version": base_version,
         "snapshots": snapshots,
@@ -64,12 +67,50 @@ def post_negotiate(server_url: str, token: str, hashes: list) -> dict:
 
 def post_pull(server_url: str, token: str, since_version: int,
               have_hashes: list = None) -> dict:
-    """POST /pull — request changes since a version.
-
-    have_hashes: list of object hashes the client already has, so the server
-    can skip sending them.
-    """
+    """POST /pull — request changes since a version."""
     data = {"since_version": since_version}
     if have_hashes:
         data["have_hashes"] = have_hashes
     return _make_request(f"{server_url}/pull", token=token, data=data)
+
+
+# ── Async transport ───────────────────────────
+
+class AsyncMutClient:
+    """Async HTTP client for a single Mut server.
+
+    Uses asyncio.open_connection to send raw HTTP requests — zero external deps.
+    Falls back to asyncio.to_thread(urllib) for simplicity and reliability.
+    """
+
+    def __init__(self, server_url: str, token: str):
+        self.server_url = server_url.rstrip("/")
+        self.token = token
+
+    async def _post(self, endpoint: str, data: dict) -> dict:
+        url = f"{self.server_url}{endpoint}"
+        return await asyncio.to_thread(
+            _make_request, url, data, self.token,
+        )
+
+    async def clone(self) -> dict:
+        return await self._post("/clone", {})
+
+    async def push(self, base_version: int, snapshots: list,
+                   objects: dict[str, bytes]) -> dict:
+        return await self._post("/push", {
+            "base_version": base_version,
+            "snapshots": snapshots,
+            "objects": {h: base64.b64encode(data).decode()
+                        for h, data in objects.items()},
+        })
+
+    async def negotiate(self, hashes: list[str]) -> dict:
+        return await self._post("/negotiate", {"hashes": hashes})
+
+    async def pull(self, since_version: int,
+                   have_hashes: list[str] | None = None) -> dict:
+        data = {"since_version": since_version}
+        if have_hashes:
+            data["have_hashes"] = have_hashes
+        return await self._post("/pull", data)

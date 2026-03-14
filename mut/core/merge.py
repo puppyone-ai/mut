@@ -14,6 +14,8 @@ a list of conflict records for audit.
 import json
 from dataclasses import dataclass, field
 
+from mut.foundation.hash import hash_bytes
+
 
 @dataclass
 class ConflictRecord:
@@ -21,7 +23,8 @@ class ConflictRecord:
     strategy: str           # "line_merge", "json_merge", "lww", etc.
     detail: str = ""
     kept: str = ""          # which side was kept ("ours", "theirs", "merged")
-    lost_content: str = ""  # content that was overwritten (for audit)
+    lost_content: str = ""  # preview of overwritten content (for display)
+    lost_hash: str = ""     # hash of full lost content in object store (for recovery)
 
 
 @dataclass
@@ -55,6 +58,8 @@ def three_way_merge(base: bytes, ours: bytes, theirs: bytes,
         return result
 
     # Fallback: Last-Writer-Wins (theirs = incoming push wins)
+    ours_hash = hash_bytes(ours)
+    ours_preview = ours.decode(errors="replace")[:500]
     return MergeResult(
         content=theirs,
         strategy="lww",
@@ -63,7 +68,8 @@ def three_way_merge(base: bytes, ours: bytes, theirs: bytes,
             strategy="lww",
             detail="both sides modified, theirs (incoming push) wins",
             kept="theirs",
-            lost_content=ours.decode(errors="replace")[:500],
+            lost_content=ours_preview,
+            lost_hash=ours_hash,
         )],
     )
 
@@ -203,12 +209,15 @@ def _merge_dicts(base: dict, ours: dict, theirs: dict,
         else:
             # LWW at key level: theirs wins
             merged[key] = t_val if t_val is not None else o_val
+            lost_val = json.dumps(o_val)
+            lost_hash = hash_bytes(lost_val.encode()) if o_val != t_val else ""
             conflicts.append(ConflictRecord(
                 path=f"{path}#{key}",
                 strategy="json_lww",
                 detail=f"both modified key '{key}'",
                 kept="theirs",
-                lost_content=json.dumps(o_val)[:200] if o_val != t_val else "",
+                lost_content=lost_val[:500],
+                lost_hash=lost_hash,
             ))
 
     return merged, conflicts

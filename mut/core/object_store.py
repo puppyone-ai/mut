@@ -7,6 +7,7 @@ Writes are atomic (temp + rename) to prevent corruption on crash.
 Reads verify the hash to detect bitrot or truncated objects.
 """
 
+import asyncio
 from pathlib import Path
 
 from mut.foundation.hash import hash_bytes
@@ -64,3 +65,20 @@ class ObjectStore:
                     n += 1
                     size += f.stat().st_size
         return n, size
+
+    # ── Async methods (for server-side use) ──────────
+
+    async def async_put(self, data: bytes) -> str:
+        return await asyncio.to_thread(self.put, data)
+
+    async def async_get(self, h: str) -> bytes:
+        return await asyncio.to_thread(self.get, h)
+
+    async def async_exists(self, h: str) -> bool:
+        return await asyncio.to_thread(self.exists, h)
+
+    async def async_all_hashes(self) -> list:
+        return await asyncio.to_thread(self.all_hashes)
+
+    async def async_count(self) -> tuple[int, int]:
+        return await asyncio.to_thread(self.count)
