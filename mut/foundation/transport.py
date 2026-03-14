@@ -1,7 +1,7 @@
 """HTTP transport layer for agent → server communication.
 
-Uses only stdlib (urllib) — no external dependencies.
-All payloads are JSON.  Binary objects are base64-encoded inside JSON.
+Uses only stdlib (urllib for sync, asyncio for async) — no external dependencies.
+All payloads are JSON. Binary objects are base64-encoded inside JSON.
 
 MutClient encapsulates authenticated requests so that individual ops
 don't duplicate auth/transport boilerplate.
@@ -9,6 +9,7 @@ don't duplicate auth/transport boilerplate.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 import urllib.request
@@ -21,6 +22,8 @@ from mut.core.protocol import (
     PushRequest, PullRequest, NegotiateRequest, CloneRequest,
 )
 
+
+# ── Sync transport ────────────────────────────
 
 def _make_request(url: str, data: dict | None = None,
                   token: str | None = None, method: str | None = None) -> dict:
@@ -112,3 +115,47 @@ def post_negotiate(server_url: str, token: str, hashes: list) -> dict:
 def post_pull(server_url: str, token: str, since_version: int,
               have_hashes: list = None) -> dict:
     return MutClient(server_url, token).pull(since_version, have_hashes)
+
+
+# ── Async transport ───────────────────────────
+
+class AsyncMutClient:
+    """Async HTTP client for a single Mut server.
+
+    Uses asyncio.to_thread(urllib) for simplicity and reliability — zero external deps.
+    """
+
+    def __init__(self, server_url: str, token: str):
+        self.server_url = server_url.rstrip("/")
+        self.token = token
+
+    async def _post(self, endpoint: str, data: dict) -> dict:
+        url = f"{self.server_url}{endpoint}"
+        return await asyncio.to_thread(
+            _make_request, url, data, self.token,
+        )
+
+    async def clone(self) -> dict:
+        return await self._post("/clone", CloneRequest().to_dict())
+
+    async def push(self, base_version: int, snapshots: list,
+                   objects: dict[str, bytes]) -> dict:
+        req = PushRequest(
+            base_version=base_version,
+            snapshots=snapshots,
+            objects={h: base64.b64encode(data).decode()
+                     for h, data in objects.items()},
+        )
+        return await self._post("/push", req.to_dict())
+
+    async def negotiate(self, hashes: list[str]) -> dict:
+        req = NegotiateRequest(hashes=hashes)
+        return await self._post("/negotiate", req.to_dict())
+
+    async def pull(self, since_version: int,
+                   have_hashes: list[str] | None = None) -> dict:
+        req = PullRequest(
+            since_version=since_version,
+            have_hashes=have_hashes or [],
+        )
+        return await self._post("/pull", req.to_dict())

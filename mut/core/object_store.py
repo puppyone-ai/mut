@@ -9,6 +9,7 @@ Future backends (S3, SQLite, …) implement the same interface.
 from __future__ import annotations
 
 import abc
+import asyncio
 from pathlib import Path
 
 from mut.foundation.hash import hash_bytes
@@ -117,3 +118,20 @@ class ObjectStore:
 
     def count(self) -> tuple[int, int]:
         return self._backend.count()
+
+    # ── Async methods (for server-side use) ──────────
+
+    async def async_put(self, data: bytes) -> str:
+        return await asyncio.to_thread(self.put, data)
+
+    async def async_get(self, h: str) -> bytes:
+        return await asyncio.to_thread(self.get, h)
+
+    async def async_exists(self, h: str) -> bool:
+        return await asyncio.to_thread(self.exists, h)
+
+    async def async_all_hashes(self) -> list[str]:
+        return await asyncio.to_thread(self.all_hashes)
+
+    async def async_count(self) -> tuple[int, int]:
+        return await asyncio.to_thread(self.count)
