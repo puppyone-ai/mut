@@ -5,6 +5,7 @@ __pycache__/
 dist/
 build/
 .eggs/
+.pytest_cache/
 
 # Node
 node_modules/
@@ -22,3 +23,5 @@ Thumbs.db
 # Environment
 .env
 *.local
+
+.mut/
