@@ -64,7 +64,7 @@ def test_count(store):
 def test_corrupt_object_detected(store):
     data = b"important data"
     h = store.put(data)
-    obj_path = store._path_for(h)
+    obj_path = store._backend._path_for(h)
     obj_path.write_bytes(b"corrupted!")
     with pytest.raises(ObjectNotFoundError, match="corrupt"):
         store.get(h)

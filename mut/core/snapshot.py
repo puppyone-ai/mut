@@ -53,7 +53,7 @@ class SnapshotChain:
         return snap
 
     def get_unpushed(self) -> list[dict]:
-        return [s for s in self.load_all() if not s.get("pushed", True)]
+        return [s for s in self.load_all() if not s.get("pushed", False)]
 
     def mark_pushed(self, up_to_id: int):
         snaps = self.load_all()

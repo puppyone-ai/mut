@@ -65,6 +65,7 @@ def cmd_issue_token(args):
 
 
 def cmd_serve(args):
+    """Start the async HTTP server."""
     serve(args.path, args.host, args.port)
 
 
