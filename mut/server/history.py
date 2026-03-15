@@ -75,17 +75,24 @@ class HistoryManager:
                                  conflicts, root_hash)
         write_json(self.dir / f"{version:06d}.json", entry)
 
-    def get_since(self, since_version: int, scope_path: str | None = None) -> list:
+    def get_since(self, since_version: int, scope_path: str | None = None,
+                   limit: int = 0) -> list:
         """Return history entries after since_version.
 
         If scope_path is given, only entries whose scope overlaps
         with scope_path are included (prevents cross-scope info leak).
+        If limit > 0, return at most that many entries (most recent).
         """
         result: list[dict] = []
         latest = self.get_latest_version()
         norm_scope = normalize_path(scope_path) if scope_path else None
 
-        for v in range(since_version + 1, latest + 1):
+        # When limit is set, scan backwards to get the most recent entries
+        start = since_version + 1
+        if limit > 0:
+            start = max(start, latest - limit + 1)
+
+        for v in range(start, latest + 1):
             entry = self.get_entry(v)
             if entry is None:
                 continue
@@ -128,11 +135,17 @@ class HistoryManager:
         await async_write_json(self.dir / f"{version:06d}.json", entry)
 
     async def async_get_since(self, since_version: int,
-                              scope_path: str | None = None) -> list:
+                              scope_path: str | None = None,
+                              limit: int = 0) -> list:
         result: list[dict] = []
         latest = await self.async_get_latest_version()
         norm_scope = normalize_path(scope_path) if scope_path else None
-        for v in range(since_version + 1, latest + 1):
+
+        start = since_version + 1
+        if limit > 0:
+            start = max(start, latest - limit + 1)
+
+        for v in range(start, latest + 1):
             entry = await self.async_get_entry(v)
             if entry is None:
                 continue
@@ -162,12 +175,22 @@ def _scopes_overlap(entry_scope: str, requesting_scope: str) -> bool:
 
 
 def _redact_for_scope(entry: dict, scope: str) -> dict:
-    """Strip change details for paths outside the requesting scope."""
-    if "changes" not in entry:
-        return entry
+    """Strip details outside the requesting scope.
+
+    - Filters changes and conflicts to only in-scope paths
+    - Removes global root hash (leaks full project tree)
+    """
     redacted = dict(entry)
-    redacted["changes"] = [
-        c for c in entry["changes"]
-        if normalize_path(c["path"]).startswith(scope)
-    ]
+    # Never expose the global root hash to scoped agents
+    redacted.pop("root", None)
+    if "changes" in entry:
+        redacted["changes"] = [
+            c for c in entry["changes"]
+            if normalize_path(c["path"]).startswith(scope)
+        ]
+    if "conflicts" in entry:
+        redacted["conflicts"] = [
+            c for c in entry["conflicts"]
+            if normalize_path(c["path"]).startswith(scope)
+        ]
     return redacted

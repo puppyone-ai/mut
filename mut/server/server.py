@@ -27,8 +27,9 @@ import asyncio
 import base64
 import json
 
-from mut.foundation.config import normalize_path
+from mut.foundation.config import normalize_path, HASH_LEN
 from mut.core.auth import verify_token
+from mut.core.protocol import PROTOCOL_VERSION
 from mut.core.merge import merge_file_sets
 from mut.core.scope import check_path_permission
 from mut.core import tree as tree_mod
@@ -41,6 +42,7 @@ from mut.server.graft import async_graft_subtree
 
 
 MAX_BODY_SIZE = 256 * 1024 * 1024  # 256 MB
+MAX_CLONE_HISTORY = 200  # Cap history entries returned on clone
 
 # Status text lookup
 _STATUS_TEXT = {
@@ -139,7 +141,8 @@ async def _handle_clone(repo: ServerRepo, auth: dict, _body: dict) -> dict:
                    for h in scope_hashes}
 
     latest = await repo.async_get_latest_version()
-    history = await repo.async_get_history_since(0, scope_path=scope["path"])
+    history = await repo.async_get_history_since(0, scope_path=scope["path"],
+                                                     limit=MAX_CLONE_HISTORY)
 
     await repo.async_record_audit("clone", auth["agent"], {
         "scope": scope["path"],
@@ -170,7 +173,8 @@ async def _handle_push(repo: ServerRepo, auth: dict, body: dict) -> dict:
     scope_id = scope["id"]
     scope_lock = repo._get_scope_lock(scope_id)
 
-    # Try to acquire scope lock without blocking
+    # Safe in asyncio: no await between locked() check and async with,
+    # so no other coroutine can interleave — effectively atomic.
     if scope_lock.locked():
         raise LockError("scope is locked by another push, retry later")
 
@@ -272,10 +276,17 @@ async def _push_locked(repo: ServerRepo, scope: dict, auth: dict, body: dict) ->
     return result
 
 
+def _is_valid_hash(h: str) -> bool:
+    """Reject obviously invalid hash strings (too long, non-alphanumeric)."""
+    return isinstance(h, str) and 0 < len(h) <= HASH_LEN and h.isalnum()
+
+
 async def _handle_negotiate(repo: ServerRepo, _auth: dict, body: dict) -> dict:
     offered = body.get("hashes", [])
     missing = []
     for h in offered:
+        if not _is_valid_hash(h):
+            raise ValueError(f"invalid hash: {h!r}")
         if not await repo.store.async_exists(h):
             missing.append(h)
     return {"missing": missing}
@@ -352,6 +363,16 @@ _POST_ROUTES = {
 }
 
 
+def _check_protocol_version(body: dict):
+    """Reject requests with incompatible protocol versions."""
+    client_version = body.get("protocol_version", 1)
+    if client_version > PROTOCOL_VERSION:
+        raise ValueError(
+            f"unsupported protocol version {client_version} "
+            f"(server supports up to {PROTOCOL_VERSION})"
+        )
+
+
 async def _dispatch(repo: ServerRepo, method: str, path: str,
                     headers: dict, body: dict) -> tuple[dict, int]:
     """Route a request to the appropriate handler. Returns (response_dict, status_code)."""
@@ -368,6 +389,7 @@ async def _dispatch(repo: ServerRepo, method: str, path: str,
     if handler is None:
         return {"error": f"unknown endpoint: {path}"}, 404
 
+    _check_protocol_version(body)
     auth = await _auth(repo, headers)
     return await handler(repo, auth, body), 200
 

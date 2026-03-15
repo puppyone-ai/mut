@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import time
 import urllib.request
 import urllib.error
 from typing import Optional
@@ -25,9 +26,48 @@ from mut.core.protocol import (
 
 # ── Sync transport ────────────────────────────
 
+_DEFAULT_TIMEOUT = 60  # seconds
+_MAX_RETRIES = 3
+_RETRY_BACKOFF = 1.0  # base seconds; doubles each retry
+_RETRYABLE_CODES = {429, 502, 503, 504}
+
+
+def _parse_http_error(e: urllib.error.HTTPError) -> str:
+    """Extract error message from an HTTPError response body."""
+    try:
+        detail = json.loads(e.read().decode())
+        return detail.get("error", str(e))
+    except Exception:
+        return str(e)
+
+
+def _retry_delay(e: urllib.error.HTTPError | None, attempt: int) -> float:
+    """Compute delay before next retry, respecting Retry-After header."""
+    if isinstance(e, urllib.error.HTTPError):
+        retry_after = e.headers.get("Retry-After")
+        if retry_after:
+            return float(retry_after)
+    return _RETRY_BACKOFF * (2 ** attempt)
+
+
+def _do_request(url: str, body: bytes | None, headers: dict,
+                method: str, timeout: int) -> dict:
+    """Execute a single HTTP request. Raises urllib errors on failure."""
+    req = urllib.request.Request(url, data=body, headers=headers, method=method)
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read().decode())
+
+
+def _is_retryable(e: Exception) -> bool:
+    if isinstance(e, urllib.error.HTTPError):
+        return e.code in _RETRYABLE_CODES
+    return isinstance(e, urllib.error.URLError)
+
+
 def _make_request(url: str, data: dict | None = None,
-                  token: str | None = None, method: str | None = None) -> dict:
-    """Send an HTTP request, return parsed JSON response."""
+                  token: str | None = None, method: str | None = None,
+                  timeout: int = _DEFAULT_TIMEOUT) -> dict:
+    """Send an HTTP request with retry on transient failures."""
     headers: dict[str, str] = {"Content-Type": "application/json"}
     if token:
         headers["Authorization"] = f"Bearer {token}"
@@ -36,19 +76,26 @@ def _make_request(url: str, data: dict | None = None,
     if method is None:
         method = "POST" if body else "GET"
 
-    req = urllib.request.Request(url, data=body, headers=headers, method=method)
-    try:
-        with urllib.request.urlopen(req, timeout=60) as resp:
-            return json.loads(resp.read().decode())
-    except urllib.error.HTTPError as e:
+    last_exc: Exception | None = None
+    for attempt in range(_MAX_RETRIES):
         try:
-            detail = json.loads(e.read().decode())
-            msg = detail.get("error", str(e))
-        except Exception:
-            msg = str(e)
-        raise NetworkError(f"server error ({e.code}): {msg}")
-    except urllib.error.URLError as e:
+            return _do_request(url, body, headers, method, timeout)
+        except urllib.error.URLError as e:
+            last_exc = e
+            if _is_retryable(e) and attempt < _MAX_RETRIES - 1:
+                time.sleep(_retry_delay(e, attempt))
+                continue
+            _raise_as_network_error(e)
+
+    raise NetworkError(f"request failed after {_MAX_RETRIES} retries: {last_exc}")
+
+
+def _raise_as_network_error(e: Exception):
+    if isinstance(e, urllib.error.HTTPError):
+        raise NetworkError(f"server error ({e.code}): {_parse_http_error(e)}")
+    if isinstance(e, urllib.error.URLError):
         raise NetworkError(f"cannot reach server: {e.reason}")
+    raise NetworkError(str(e))
 
 
 class MutClient:

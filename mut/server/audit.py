@@ -1,5 +1,6 @@
 """Server-side audit log with sync and async support."""
 
+import secrets
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -14,7 +15,8 @@ class AuditLog:
 
     def _make_entry(self, event_type: str, agent_id: str, detail: dict) -> tuple:
         ts = datetime.now(timezone.utc)
-        filename = ts.strftime("%Y%m%d_%H%M%S") + f"_{agent_id}_{event_type}.json"
+        uid = secrets.token_hex(2)  # 4-char hex to avoid filename collisions
+        filename = ts.strftime("%Y%m%d_%H%M%S") + f"_{uid}_{agent_id}_{event_type}.json"
         entry = {
             "type": event_type,
             "agent": agent_id,

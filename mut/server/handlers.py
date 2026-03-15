@@ -40,8 +40,10 @@ def handle_clone(repo: ServerRepo, auth: dict, body: dict) -> dict:
     objects_b64 = {h: base64.b64encode(repo.store.get(h)).decode()
                    for h in scope_hashes}
 
+    MAX_CLONE_HISTORY = 200
     latest = repo.get_latest_version()
-    history = repo.get_history_since(0, scope_path=scope["path"])
+    history = repo.get_history_since(0, scope_path=scope["path"],
+                                     limit=MAX_CLONE_HISTORY)
 
     repo.record_audit("clone", auth["agent"], {
         "scope": scope["path"],
@@ -121,7 +123,8 @@ def _push_locked(repo: ServerRepo, scope: dict, auth: dict, body: dict) -> dict:
             "server_version": current_version,
             "conflicts": [
                 {"path": c.path, "strategy": c.strategy,
-                 "detail": c.detail, "kept": c.kept}
+                 "detail": c.detail, "kept": c.kept,
+                 "lost_content": c.lost_content, "lost_hash": c.lost_hash}
                 for c in merge_conflicts
             ],
         })

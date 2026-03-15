@@ -232,8 +232,9 @@ class ServerRepo:
         self.history.record(version, who, message, scope_path, changes,
                             conflicts, root_hash)
 
-    def get_history_since(self, since_version: int, scope_path: str | None = None) -> list:
-        return self.history.get_since(since_version, scope_path)
+    def get_history_since(self, since_version: int, scope_path: str | None = None,
+                           limit: int = 0) -> list:
+        return self.history.get_since(since_version, scope_path, limit=limit)
 
     def get_history_entry(self, version: int) -> dict | None:
         return self.history.get_entry(version)
@@ -258,8 +259,9 @@ class ServerRepo:
                                         conflicts, root_hash)
 
     async def async_get_history_since(self, since_version: int,
-                                      scope_path: str = None) -> list:
-        return await self.history.async_get_since(since_version, scope_path)
+                                      scope_path: str = None,
+                                      limit: int = 0) -> list:
+        return await self.history.async_get_since(since_version, scope_path, limit=limit)
 
     async def async_get_history_entry(self, version: int) -> dict | None:
         return await self.history.async_get_entry(version)
