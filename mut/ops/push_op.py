@@ -13,6 +13,7 @@ from mut.foundation.config import REMOTE_HEAD_FILE, TOKEN_FILE, load_config
 from mut.foundation.fs import read_text, write_text
 from mut.foundation.transport import MutClient
 from mut.core import manifest as manifest_mod
+from mut.core import tree as tree_mod
 from mut.core.diff import diff_manifests
 
 
@@ -44,12 +45,19 @@ def push(repo: MutRepo) -> dict:
     remote_head_path = repo.mut_root / REMOTE_HEAD_FILE
     base_version = int(read_text(remote_head_path)) if remote_head_path.exists() else 0
 
-    all_hashes = repo.store.all_hashes()
-    negotiate_resp = client.negotiate(all_hashes)
-    missing_hashes = set(negotiate_resp.get("missing", all_hashes))
+    # Only collect hashes reachable from unpushed snapshots, not entire store
+    relevant_hashes: set[str] = set()
+    for s in unpushed:
+        relevant_hashes.update(
+            tree_mod.collect_reachable_hashes(repo.store, s["root"])
+        )
+    relevant_list = list(relevant_hashes)
+
+    negotiate_resp = client.negotiate(relevant_list)
+    missing_hashes = set(negotiate_resp.get("missing", relevant_list))
 
     objects: dict[str, bytes] = {
-        h: repo.store.get(h) for h in all_hashes if h in missing_hashes
+        h: repo.store.get(h) for h in relevant_hashes if h in missing_hashes
     }
 
     snap_data = [

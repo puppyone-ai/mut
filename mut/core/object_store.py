@@ -40,6 +40,10 @@ class StorageBackend(abc.ABC):
     def count(self) -> tuple[int, int]:
         """Return (object_count, total_bytes)."""
 
+    @abc.abstractmethod
+    def delete(self, h: str) -> bool:
+        """Delete an object by hash. Returns True if it existed."""
+
 
 class FileSystemBackend(StorageBackend):
     """Default backend: objects/<first 2 hex chars>/<remaining hex chars>."""
@@ -85,6 +89,17 @@ class FileSystemBackend(StorageBackend):
                     size += f.stat().st_size
         return n, size
 
+    def delete(self, h: str) -> bool:
+        path = self._path_for(h)
+        if path.exists():
+            path.unlink()
+            # Remove empty parent dir
+            parent = path.parent
+            if parent.exists() and not any(parent.iterdir()):
+                parent.rmdir()
+            return True
+        return False
+
 
 class ObjectStore:
     """Content-addressable store that hashes on write and verifies on read.
@@ -118,6 +133,14 @@ class ObjectStore:
 
     def count(self) -> tuple[int, int]:
         return self._backend.count()
+
+    def gc(self, reachable: set[str]) -> int:
+        """Delete objects not in the reachable set. Returns count deleted."""
+        deleted = 0
+        for h in self.all_hashes():
+            if h not in reachable and self._backend.delete(h):
+                deleted += 1
+        return deleted
 
     # ── Async methods (for server-side use) ──────────
 

@@ -84,6 +84,12 @@ class InMemoryBackend(StorageBackend):
         size = sum(len(v) for v in self._store.values())
         return n, size
 
+    def delete(self, h: str) -> bool:
+        if h in self._store:
+            del self._store[h]
+            return True
+        return False
+
 
 class TestCustomBackend:
     def test_object_store_with_memory_backend(self, tmp_path):

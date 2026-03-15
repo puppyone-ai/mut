@@ -43,13 +43,13 @@ def cmd_create_invite(args):
     host = args.host or "localhost"
     port = args.port or 9742
     url = f"http://{host}:{port}/invite/{invite['id']}"
-    print(f"Invite created:")
+    print("Invite created:")
     print(f"  scope: {invite['scope_path']} ({invite['mode']})")
     print(f"  max uses: {invite['max_uses'] or 'unlimited'}")
-    print(f"")
+    print("")
     print(f"  {url}")
-    print(f"")
-    print(f"Share this URL. Agents can register with:")
+    print("")
+    print("Share this URL. Agents can register with:")
     print(f"  mut register {url}")
 
 

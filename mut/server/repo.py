@@ -66,12 +66,21 @@ class ServerRepo:
         # Async locks for concurrent safety
         self._global_lock = asyncio.Lock()      # protects version + root_hash
         self._scope_locks: dict[str, asyncio.Lock] = {}  # per-scope push serialization
+        self._MAX_SCOPE_LOCKS = 1000
 
     def _get_scope_lock(self, scope_id: str) -> asyncio.Lock:
-        """Get or create an asyncio.Lock for a scope."""
+        """Get or create an asyncio.Lock for a scope, with lazy eviction."""
         if scope_id not in self._scope_locks:
+            if len(self._scope_locks) >= self._MAX_SCOPE_LOCKS:
+                self._evict_idle_locks()
             self._scope_locks[scope_id] = asyncio.Lock()
         return self._scope_locks[scope_id]
+
+    def _evict_idle_locks(self):
+        """Remove unlocked entries to prevent unbounded dict growth."""
+        idle = [k for k, v in self._scope_locks.items() if not v.locked()]
+        for k in idle:
+            del self._scope_locks[k]
 
     # ── Init ──────────────────────────────────────
 
