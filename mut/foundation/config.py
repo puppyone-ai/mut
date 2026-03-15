@@ -37,6 +37,15 @@ BUILTIN_IGNORE = {".mut", ".mut-server", ".git", ".DS_Store", "__pycache__", ".e
 HASH_LEN = 16
 
 
+def normalize_path(path: str) -> str:
+    """Strip leading/trailing slashes from a scope or file path.
+
+    Used everywhere that compares scope paths, file paths, or exclusions
+    to ensure consistent format regardless of how the path was stored.
+    """
+    return path.strip("/")
+
+
 # ── Unified config I/O ───────────────────────
 
 def load_config(mut_root: Path) -> dict:

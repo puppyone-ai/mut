@@ -10,7 +10,7 @@ import json
 from pathlib import Path
 
 from mut.foundation.config import (
-    MUT_DIR, OBJECTS_DIR, SNAPSHOTS_FILE, MANIFEST_FILE,
+    MUT_DIR, OBJECTS_DIR, SNAPSHOTS_FILE,
     HEAD_FILE, REMOTE_HEAD_FILE, CONFIG_FILE, TOKEN_FILE,
 )
 from mut.foundation.fs import write_json, write_text, mkdir_p, is_safe_path
@@ -61,6 +61,9 @@ def clone(server_url: str, token: str, workdir: str = None) -> MutRepo:
         target = root / rel_path
         if not is_safe_path(root, target):
             raise ValueError(f"server sent unsafe path: {rel_path}")
+        # Files from server are already relative to scope root.
+        # is_safe_path above prevents path traversal (../ attacks).
+        # No further scope prefix check needed — the server strips it.
         mkdir_p(target.parent)
         target.write_bytes(base64.b64decode(b64data))
 

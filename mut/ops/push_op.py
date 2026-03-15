@@ -6,13 +6,14 @@
 4. Update REMOTE_HEAD + mark pushed
 """
 
+from __future__ import annotations
+
 from mut.ops.repo import MutRepo
-from mut.foundation.config import (
-    REMOTE_HEAD_FILE, TOKEN_FILE, load_config,
-)
+from mut.foundation.config import REMOTE_HEAD_FILE, TOKEN_FILE, load_config
 from mut.foundation.fs import read_text, write_text
-from mut.foundation.transport import post_push, post_negotiate
+from mut.foundation.transport import MutClient
 from mut.core import manifest as manifest_mod
+from mut.core import tree as tree_mod
 from mut.core.diff import diff_manifests
 
 
@@ -26,6 +27,7 @@ def push(repo: MutRepo) -> dict:
         return _local_push(repo)
 
     token = read_text(repo.mut_root / TOKEN_FILE)
+    client = MutClient(server_url, token)
 
     unpushed = repo.snapshots.get_unpushed()
     if not unpushed:
@@ -43,14 +45,20 @@ def push(repo: MutRepo) -> dict:
     remote_head_path = repo.mut_root / REMOTE_HEAD_FILE
     base_version = int(read_text(remote_head_path)) if remote_head_path.exists() else 0
 
-    all_hashes = repo.store.all_hashes()
-    negotiate_resp = post_negotiate(server_url, token, all_hashes)
-    missing_hashes = set(negotiate_resp.get("missing", all_hashes))
+    # Only collect hashes reachable from unpushed snapshots, not entire store
+    relevant_hashes: set[str] = set()
+    for s in unpushed:
+        relevant_hashes.update(
+            tree_mod.collect_reachable_hashes(repo.store, s["root"])
+        )
+    relevant_list = list(relevant_hashes)
 
-    objects = {}
-    for h in all_hashes:
-        if h in missing_hashes:
-            objects[h] = repo.store.get(h)
+    negotiate_resp = client.negotiate(relevant_list)
+    missing_hashes = set(negotiate_resp.get("missing", relevant_list))
+
+    objects: dict[str, bytes] = {
+        h: repo.store.get(h) for h in relevant_hashes if h in missing_hashes
+    }
 
     snap_data = [
         {"id": s["id"], "root": s["root"], "message": s.get("message", ""),
@@ -58,20 +66,32 @@ def push(repo: MutRepo) -> dict:
         for s in unpushed
     ]
 
-    resp = post_push(server_url, token, base_version, snap_data, objects)
+    resp = client.push(base_version, snap_data, objects)
 
     server_version = resp.get("version", base_version)
     latest_id = unpushed[-1]["id"]
     repo.snapshots.mark_pushed(latest_id)
-    write_text(remote_head_path, str(server_version))
 
-    result = {
+    merged = resp.get("merged", False)
+    others_pushed = server_version > base_version + 1
+
+    if merged or others_pushed:
+        # Our local working directory doesn't reflect the full server state.
+        # Either: (a) server merged our changes with others' (merged=True),
+        # or (b) other agents pushed between our base_version and now.
+        # Keep REMOTE_HEAD at base_version so the next pull fetches
+        # the complete server state including other agents' changes.
+        write_text(remote_head_path, str(base_version))
+    else:
+        write_text(remote_head_path, str(server_version))
+
+    result: dict = {
         "status": "pushed",
         "pushed": len(unpushed),
         "latest_id": latest_id,
         "server_version": server_version,
     }
-    if resp.get("merged"):
+    if merged:
         result["merged"] = True
         result["conflicts"] = resp.get("conflicts", 0)
     return result

@@ -11,6 +11,8 @@ Credentials are stored per-server in ~/.mut/credentials.json:
   }
 """
 
+from __future__ import annotations
+
 import json
 from pathlib import Path
 from urllib.parse import urlparse

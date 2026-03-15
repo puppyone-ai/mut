@@ -15,7 +15,7 @@ import hmac
 import json
 import time
 
-from mut.foundation.error import PermissionDenied
+from mut.foundation.error import AuthenticationError
 
 
 def _b64url_encode(data: bytes) -> str:
@@ -32,8 +32,13 @@ def _b64url_decode(s: str) -> bytes:
 _HEADER = _b64url_encode(json.dumps({"alg": "HS256", "typ": "MUT"}).encode())
 
 
-def sign_token(secret: str, agent_id: str, scope: str, mode: str = "rw",
-               expiry_seconds: int = 0) -> str:
+def sign_token(
+    secret: str,
+    agent_id: str,
+    scope: str,
+    mode: str = "rw",
+    expiry_seconds: int = 0
+) -> str:
     """Issue a token.  expiry_seconds=0 means no expiry."""
     payload = {
         "agent": agent_id,
@@ -48,21 +53,21 @@ def sign_token(secret: str, agent_id: str, scope: str, mode: str = "rw",
 
 
 def verify_token(token: str, secret: str) -> dict:
-    """Verify signature and expiry.  Returns payload dict or raises PermissionDenied."""
+    """Verify signature and expiry.  Returns payload dict or raises AuthenticationError."""
     parts = token.split(".")
     if len(parts) != 3:
-        raise PermissionDenied("malformed token")
+        raise AuthenticationError("malformed token")
 
     signing_input = f"{parts[0]}.{parts[1]}"
     expected_sig = hmac.new(secret.encode(), signing_input.encode(), hashlib.sha256).digest()
     actual_sig = _b64url_decode(parts[2])
 
     if not hmac.compare_digest(expected_sig, actual_sig):
-        raise PermissionDenied("invalid token signature")
+        raise AuthenticationError("invalid token signature")
 
     payload = json.loads(_b64url_decode(parts[1]))
 
     if payload.get("exp", 0) > 0 and payload["exp"] < time.time():
-        raise PermissionDenied("token expired")
+        raise AuthenticationError("token expired")
 
     return payload
