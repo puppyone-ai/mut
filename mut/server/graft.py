@@ -15,8 +15,10 @@ from mut.foundation.config import normalize_path
 from mut.core.object_store import ObjectStore
 
 
-def graft_subtree(store: ObjectStore, old_root_hash: str,
-                  scope_path: str, new_subtree_hash: str) -> str:
+def graft_subtree(
+    store: ObjectStore, old_root_hash: str,
+    scope_path: str, new_subtree_hash: str
+) -> str:
     """Replace the subtree at scope_path with new_subtree_hash.
 
     Returns the new root hash with all intermediate hashes recomputed.
@@ -31,8 +33,10 @@ def graft_subtree(store: ObjectStore, old_root_hash: str,
     return _graft_recursive(store, old_root_hash, parts, new_subtree_hash)
 
 
-def _graft_recursive(store: ObjectStore, tree_hash: str,
-                     path_parts: list, new_hash: str) -> str:
+def _graft_recursive(
+    store: ObjectStore, tree_hash: str,
+    path_parts: list, new_hash: str
+) -> str:
     """Recursively descend the tree, replace the target node, rebuild upward."""
     entries = json.loads(store.get(tree_hash))
 
@@ -55,8 +59,10 @@ def _graft_recursive(store: ObjectStore, tree_hash: str,
     return store.put(json.dumps(entries, sort_keys=True).encode())
 
 
-async def async_graft_subtree(store: ObjectStore, old_root_hash: str,
-                              scope_path: str, new_subtree_hash: str) -> str:
+async def async_graft_subtree(
+    store: ObjectStore, old_root_hash: str,
+    scope_path: str, new_subtree_hash: str
+) -> str:
     """Async version of graft_subtree."""
     if not scope_path:
         return new_subtree_hash
@@ -65,8 +71,10 @@ async def async_graft_subtree(store: ObjectStore, old_root_hash: str,
     return await _async_graft_recursive(store, old_root_hash, parts, new_subtree_hash)
 
 
-async def _async_graft_recursive(store: ObjectStore, tree_hash: str,
-                                 path_parts: list, new_hash: str) -> str:
+async def _async_graft_recursive(
+    store: ObjectStore, tree_hash: str,
+    path_parts: list, new_hash: str
+) -> str:
     """Async recursive graft."""
     data = await store.async_get(tree_hash)
     entries = json.loads(data)

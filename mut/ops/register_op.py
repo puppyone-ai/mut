@@ -6,10 +6,8 @@
 """
 
 from __future__ import annotations
-
 from urllib.parse import urlparse
 
-from mut.foundation.error import NetworkError
 from mut.foundation.credentials import save_credential
 from mut.foundation.transport import _make_request
 

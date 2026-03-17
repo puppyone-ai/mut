@@ -28,7 +28,7 @@ from mut.server.repo import ServerRepo
 
 # ── Clone ──────────────────────────────────────
 
-def handle_clone(repo: ServerRepo, auth: dict, body: dict) -> dict:
+def handle_clone(repo: ServerRepo, auth: dict, _body: dict) -> dict:
     scope = auth["_scope"]
 
     files_raw = repo.list_scope_files(scope)
@@ -165,7 +165,7 @@ def _push_locked(repo: ServerRepo, scope: dict, auth: dict, body: dict) -> dict:
 
 # ── Negotiate ──────────────────────────────────
 
-def handle_negotiate(repo: ServerRepo, auth: dict, body: dict) -> dict:
+def handle_negotiate(repo: ServerRepo, _auth: dict, body: dict) -> dict:
     req = NegotiateRequest.from_dict(body)
     missing = [h for h in req.hashes if not repo.store.exists(h)]
     return NegotiateResponse(missing=missing).to_dict()
@@ -191,7 +191,9 @@ def handle_pull(repo: ServerRepo, auth: dict, body: dict) -> dict:
     objects_b64 = {h: base64.b64encode(repo.store.get(h)).decode()
                    for h in scope_hashes if h not in have_hashes}
 
-    history = repo.get_history_since(req.since_version, scope_path=scope["path"])
+    MAX_PULL_HISTORY = 200
+    history = repo.get_history_since(req.since_version, scope_path=scope["path"],
+                                     limit=MAX_PULL_HISTORY)
 
     repo.record_audit("pull", auth["agent"], {
         "scope": scope["path"],
@@ -289,8 +291,7 @@ def _compute_changeset(scope_prefix: str, old_files: dict,
     return changes
 
 
-def _flatten_tree_to_bytes(store: ObjectStore, tree_hash: str,
-                           prefix: str = "") -> dict:
+def _flatten_tree_to_bytes(store: ObjectStore, tree_hash: str) -> dict:
     """Flatten tree into {relative_path: bytes_content}."""
     flat_hashes = tree_mod.tree_to_flat(store, tree_hash)
     return {path: store.get(h) for path, h in flat_hashes.items()}

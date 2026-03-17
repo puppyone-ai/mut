@@ -7,7 +7,13 @@ from mut.core.snapshot import SnapshotChain
 
 @pytest.fixture
 def chain(tmp_path):
+    # Pass .json path to test legacy-compatible init
     return SnapshotChain(tmp_path / "snapshots.json")
+
+
+@pytest.fixture
+def chain_dir(tmp_path):
+    return SnapshotChain(tmp_path / "snapshots")
 
 
 class TestSnapshotChain:

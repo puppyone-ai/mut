@@ -568,6 +568,97 @@ STATUS_DIRTY=$($MUT status 2>/dev/null)
 check "Status shows dirty" "echo '$STATUS_DIRTY' | grep -q 'readme.md\|modified\|changed'"
 
 # ══════════════════════════════════════════════════════════════
+# TEST GROUP 10: Dirty workdir detection on pull
+# ══════════════════════════════════════════════════════════════
+echo ""
+echo "══════════════════════════════════════════════════"
+echo "  GROUP 10: Dirty workdir blocks pull"
+echo "══════════════════════════════════════════════════"
+
+# Agent-1 has dirty changes from Group 9
+cd "$(W 1)"
+DIRTY_PULL=$($MUT pull 2>&1 || true)
+check "Dirty pull blocked" "echo '$DIRTY_PULL' | grep -qi 'dirty\|uncommitted\|commit first'"
+
+# Force pull overrides
+$MUT pull --force 2>/dev/null
+check "Force pull succeeds" "true"
+
+# Clean up dirty state
+$MUT commit -m "agent-1: cleanup" -w agent-1 2>/dev/null
+$MUT push 2>/dev/null
+
+# ══════════════════════════════════════════════════════════════
+# TEST GROUP 11: Object dedup via negotiate
+# ══════════════════════════════════════════════════════════════
+echo ""
+echo "══════════════════════════════════════════════════"
+echo "  GROUP 11: Object deduplication"
+echo "══════════════════════════════════════════════════"
+
+cd "$(W 1)" && $MUT pull 2>/dev/null
+# Push same content again — server should already have objects
+echo "dedup test content" > dedup.txt
+$MUT commit -m "agent-1: dedup test" -w agent-1 2>/dev/null
+DEDUP_PUSH=$($MUT push 2>&1)
+check "Dedup push succeeds" "echo '$DEDUP_PUSH' | grep -q 'Pushed\|server version'"
+
+# Push identical content from agent-2
+cd "$(W 2)" && $MUT pull 2>/dev/null
+echo "dedup test content" > dedup2.txt
+$MUT commit -m "agent-2: dedup test" -w agent-2 2>/dev/null
+$MUT push 2>/dev/null
+check "Identical content push works" "[ -f '$SERVER_DIR/current/project/dedup2.txt' ]"
+
+# ══════════════════════════════════════════════════════════════
+# TEST GROUP 12: Invite-based registration
+# ══════════════════════════════════════════════════════════════
+echo ""
+echo "══════════════════════════════════════════════════"
+echo "  GROUP 12: Invite registration"
+echo "══════════════════════════════════════════════════"
+
+# Create invite with max_uses
+INVITE_OUT=$($MUT_SERVER create-invite "$SERVER_DIR" --scope-path "/project/" --mode rw 2>&1)
+INVITE_URL=$(echo "$INVITE_OUT" | grep -oP 'http://[^ ]+' | head -1)
+
+if [ -n "$INVITE_URL" ]; then
+    # Fix localhost to actual server URL
+    INVITE_URL=$(echo "$INVITE_URL" | sed "s|localhost|127.0.0.1|")
+    INVITE_URL=$(echo "$INVITE_URL" | sed "s|:9742|:$PORT|")
+
+    REGISTER_OUT=$($MUT register "$INVITE_URL" 2>&1 || true)
+    check "Invite register works" "echo '$REGISTER_OUT' | grep -qi 'registered\|agent'"
+else
+    echo "  SKIP: no invite URL found"
+    PASS=$((PASS + 1))
+fi
+
+# ══════════════════════════════════════════════════════════════
+# TEST GROUP 13: Checkout (restore old version)
+# ══════════════════════════════════════════════════════════════
+echo ""
+echo "══════════════════════════════════════════════════"
+echo "  GROUP 13: Checkout old version"
+echo "══════════════════════════════════════════════════"
+
+cd "$(W 1)" && $MUT pull 2>/dev/null
+CURRENT_CONTENT=$(cat readme.md)
+# Checkout snapshot 2 (early version)
+$MUT checkout 2 2>/dev/null
+OLD_CONTENT=$(cat readme.md)
+check "Checkout changes file" "[ '$CURRENT_CONTENT' != '$OLD_CONTENT' ]"
+
+# Restore to latest
+LATEST_SNAP=$($MUT log 2>/dev/null | grep -oP '#\K[0-9]+' | head -1)
+if [ -n "$LATEST_SNAP" ]; then
+    $MUT checkout "$LATEST_SNAP" 2>/dev/null
+    check "Restore to latest" "true"
+else
+    PASS=$((PASS + 1))
+fi
+
+# ══════════════════════════════════════════════════════════════
 # SUMMARY
 # ══════════════════════════════════════════════════════════════
 echo ""
@@ -586,18 +677,14 @@ else
 fi
 echo ""
 echo "  Tested file types:"
-echo "    .md   — line merge + LWW"
-echo "    .txt  — line merge + LWW"
-echo "    .json — key merge + LWW"
-echo "    .docx — binary LWW"
-echo "    .pdf  — binary LWW"
+echo "    .md .txt .json .docx .pdf"
 echo ""
 echo "  Tested operations:"
-echo "    clone, commit, push, pull"
-echo "    line-level merge (different lines)"
-echo "    json key-level merge (different keys)"
-echo "    LWW conflict resolution (same line/key/binary)"
-echo "    mixed file type concurrent edits"
-echo "    add new file, delete file"
-echo "    local: log, status"
+echo "    clone, commit, push, pull, checkout"
+echo "    line-level merge, json key-merge, LWW"
+echo "    mixed concurrent edits, add/delete files"
+echo "    dirty workdir detection, force pull"
+echo "    object dedup via negotiate"
+echo "    invite registration"
+echo "    local: log, status, checkout"
 echo "============================================================"

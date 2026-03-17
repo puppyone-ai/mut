@@ -32,8 +32,13 @@ def _b64url_decode(s: str) -> bytes:
 _HEADER = _b64url_encode(json.dumps({"alg": "HS256", "typ": "MUT"}).encode())
 
 
-def sign_token(secret: str, agent_id: str, scope: str, mode: str = "rw",
-               expiry_seconds: int = 0) -> str:
+def sign_token(
+    secret: str,
+    agent_id: str,
+    scope: str,
+    mode: str = "rw",
+    expiry_seconds: int = 0
+) -> str:
     """Issue a token.  expiry_seconds=0 means no expiry."""
     payload = {
         "agent": agent_id,

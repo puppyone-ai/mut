@@ -47,8 +47,8 @@ def cmd_register(args):
     print(f"  agent:   {result['agent_id']}")
     print(f"  project: {result['project']}")
     print(f"  scope:   {result['scope'].get('path', '/')}")
-    print(f"")
-    print(f"Credentials saved. You can now clone:")
+    print("")
+    print("Credentials saved. You can now clone:")
     print(f"  mut clone {result['server']}")
 
 
@@ -166,7 +166,7 @@ def cmd_push(args):
     result = push_op.push(repo)
     if result["status"] == "dirty":
         print(f"You have {result['uncommitted']} uncommitted change(s).")
-        print(f"  Run 'mut commit -m \"...\"' first, then push.")
+        print("  Run 'mut commit -m \"...\"' first, then push.")
         return
     if result["status"] == "up-to-date":
         print("Everything up-to-date")

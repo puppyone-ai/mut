@@ -10,10 +10,9 @@ import json
 from pathlib import Path
 
 from mut.foundation.config import (
-    MUT_DIR, OBJECTS_DIR, SNAPSHOTS_FILE, MANIFEST_FILE,
+    MUT_DIR, OBJECTS_DIR, SNAPSHOTS_FILE,
     HEAD_FILE, REMOTE_HEAD_FILE, CONFIG_FILE, TOKEN_FILE,
 )
-from mut.foundation.config import normalize_path
 from mut.foundation.fs import write_json, write_text, mkdir_p, is_safe_path
 from mut.foundation.transport import post_clone
 from mut.core import tree as tree_mod

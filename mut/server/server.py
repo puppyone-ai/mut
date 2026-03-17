@@ -500,8 +500,11 @@ def _get_base_files(repo, scope, base_version) -> dict:
 
 # ── Server entry point ────────────────────────
 
+_GRACEFUL_TIMEOUT = 10  # seconds to wait for in-flight requests
+
+
 async def async_serve(repo_root: str, host: str = "127.0.0.1", port: int = 9742):
-    """Start the async Mut HTTP server."""
+    """Start the async Mut HTTP server with graceful shutdown."""
     repo = ServerRepo(repo_root)
     repo.check_init()
 
@@ -514,8 +517,15 @@ async def async_serve(repo_root: str, host: str = "127.0.0.1", port: int = 9742)
                 0, "server", "initial state", "/", [], root_hash=root,
             )
 
+    active_tasks: set[asyncio.Task] = set()
+
     async def on_connection(reader, writer):
-        await _handle_connection(repo, reader, writer)
+        task = asyncio.current_task()
+        active_tasks.add(task)
+        try:
+            await _handle_connection(repo, reader, writer)
+        finally:
+            active_tasks.discard(task)
 
     server = await asyncio.start_server(on_connection, host, port)
     print(f"Mut async server listening on http://{host}:{port}")
@@ -523,8 +533,23 @@ async def async_serve(repo_root: str, host: str = "127.0.0.1", port: int = 9742)
     print(f"  version: {repo.get_latest_version()}")
     print(f"  root: {repo.get_root_hash()[:16]}")
 
-    async with server:
-        await server.serve_forever()
+    try:
+        async with server:
+            await server.serve_forever()
+    except asyncio.CancelledError:
+        # Graceful shutdown: clean up then re-raise per asyncio contract
+        server.close()
+        await server.wait_closed()
+        if active_tasks:
+            print(f"Waiting for {len(active_tasks)} in-flight request(s)...")
+            await asyncio.wait(active_tasks, timeout=_GRACEFUL_TIMEOUT)
+        print("Server stopped.")
+        raise
+    finally:
+        # Ensure cleanup runs for non-cancellation exits too
+        if server.is_serving():
+            server.close()
+            await server.wait_closed()
 
 
 def serve(repo_root: str, host: str = "127.0.0.1", port: int = 9742):
