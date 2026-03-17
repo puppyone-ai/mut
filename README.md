@@ -1,8 +1,12 @@
+<p align="center">
+  <img src="assets/MUT.svg" alt="Mut Logo" width="200">
+</p>
+
 # Mut
 
-Version control built for AI agents. Git's Merkle tree + SVN's central authority + agent-native constraints.
+Version control for AI agent context.
 
-Each agent sees only its own subtree. Commits never fail. The server merges everything.
+Centralized, folder-level isolation for multiple agents. Server is the source of truth. No conflicts, no failed commits.
 
 ## Why Not Git?
 
