@@ -14,6 +14,8 @@ Server directory layout:
       └── locks/          ← atomic lock files
 """
 
+from __future__ import annotations
+
 import json
 import secrets
 from pathlib import Path
@@ -31,11 +33,25 @@ from mut.foundation.fs import (
 )
 from mut.core.object_store import ObjectStore
 from mut.core.ignore import IgnoreRules
+from mut.core.protocol import normalize_path
 from mut.core import tree as tree_mod
 from mut.core.auth import sign_token
 from mut.server.scope_manager import ScopeManager
 from mut.server.history import HistoryManager
 from mut.server.audit import AuditLog
+
+
+def _is_excluded(full_rel: str, excludes: list[str]) -> bool:
+    """Check if a path matches any exclusion pattern."""
+    return any(
+        full_rel.startswith(exc + "/") or full_rel == exc
+        for exc in excludes
+    )
+
+
+def _scope_base(current: Path, scope_path: str) -> Path:
+    """Resolve the filesystem base directory for a scope path."""
+    return current / scope_path if scope_path else current
 
 
 class ServerRepo:
@@ -56,7 +72,7 @@ class ServerRepo:
     # ── Init ──────────────────────────────────────
 
     @staticmethod
-    def init(repo_root: str, project_name: str = "my-project") -> "ServerRepo":
+    def init(repo_root: str, project_name: str = "my-project") -> ServerRepo:
         root = Path(repo_root).resolve()
         meta = root / MUT_SERVER_DIR
         if meta.exists():
@@ -104,7 +120,7 @@ class ServerRepo:
     # ── Invites ────────────────────────────────────
 
     def create_invite(self, scope_path: str, mode: str = "rw",
-                      exclude: list = None, max_uses: int = 0) -> dict:
+                      exclude: list | None = None, max_uses: int = 0) -> dict:
         """Create an invite. max_uses=0 means unlimited."""
         from datetime import datetime, timezone
         invite_id = secrets.token_urlsafe(12)
@@ -156,10 +172,10 @@ class ServerRepo:
     # ── Delegated scope access ────────────────────
 
     def add_scope(self, scope_id: str, path: str, agents: list,
-                  mode: str = "rw", exclude: list = None) -> dict:
+                  mode: str = "rw", exclude: list | None = None) -> dict:
         return self.scopes.add(scope_id, path, agents, mode, exclude)
 
-    def get_scope_for_agent(self, agent_id: str) -> dict:
+    def get_scope_for_agent(self, agent_id: str) -> dict | None:
         return self.scopes.get_for_agent(agent_id)
 
     # ── Delegated history access ──────────────────
@@ -178,14 +194,14 @@ class ServerRepo:
 
     def record_history(self, version: int, who: str, message: str,
                        scope_path: str, changes: list,
-                       conflicts: list = None, root_hash: str = ""):
+                       conflicts: list | None = None, root_hash: str = ""):
         self.history.record(version, who, message, scope_path, changes,
                             conflicts, root_hash)
 
-    def get_history_since(self, since_version: int, scope_path: str = None) -> list:
+    def get_history_since(self, since_version: int, scope_path: str | None = None) -> list:
         return self.history.get_since(since_version, scope_path)
 
-    def get_history_entry(self, version: int) -> dict:
+    def get_history_entry(self, version: int) -> dict | None:
         return self.history.get_entry(version)
 
     # ── Delegated audit access ────────────────────
@@ -195,40 +211,37 @@ class ServerRepo:
 
     # ── Files in current/ ─────────────────────────
 
-    def list_scope_files(self, scope: dict) -> dict:
+    def list_scope_files(self, scope: dict) -> dict[str, bytes]:
         """Return {relative_path: file_bytes} for all files in scope."""
-        scope_path = scope["path"].strip("/")
-        excludes = [e.strip("/") for e in scope.get("exclude", [])]
-        base = self.current / scope_path if scope_path else self.current
-        result = {}
+        scope_path = normalize_path(scope["path"])
+        excludes = [normalize_path(e) for e in scope.get("exclude", [])]
+        base = _scope_base(self.current, scope_path)
 
         if not base.exists():
-            return result
+            return {}
 
-        def _walk(dirpath, prefix):
-            for child in sorted(dirpath.iterdir()):
-                if child.name in BUILTIN_IGNORE:
-                    continue
-                rel = f"{prefix}/{child.name}" if prefix else child.name
-                full_rel = f"{scope_path}/{rel}" if scope_path else rel
-                excluded = False
-                for exc in excludes:
-                    if full_rel.startswith(exc + "/") or full_rel == exc:
-                        excluded = True
-                        break
-                if excluded:
-                    continue
-                if child.is_file():
-                    result[rel] = child.read_bytes()
-                elif child.is_dir():
-                    _walk(child, rel)
-
-        _walk(base, "")
+        result: dict[str, bytes] = {}
+        self._walk_scope_dir(base, "", scope_path, excludes, result)
         return result
 
-    def write_scope_files(self, scope: dict, files: dict):
-        scope_path = scope["path"].strip("/")
-        base = self.current / scope_path if scope_path else self.current
+    def _walk_scope_dir(self, dirpath: Path, prefix: str, scope_path: str,
+                        excludes: list[str], out: dict[str, bytes]) -> None:
+        """Recursively collect files, skipping ignored and excluded paths."""
+        for child in sorted(dirpath.iterdir()):
+            if child.name in BUILTIN_IGNORE:
+                continue
+            rel = f"{prefix}/{child.name}" if prefix else child.name
+            full_rel = f"{scope_path}/{rel}" if scope_path else rel
+            if _is_excluded(full_rel, excludes):
+                continue
+            if child.is_file():
+                out[rel] = child.read_bytes()
+            elif child.is_dir():
+                self._walk_scope_dir(child, rel, scope_path, excludes, out)
+
+    def write_scope_files(self, scope: dict, files: dict) -> None:
+        scope_path = normalize_path(scope["path"])
+        base = _scope_base(self.current, scope_path)
         mkdir_p(base)
         for rel_path, content in files.items():
             target = base / rel_path
@@ -237,9 +250,9 @@ class ServerRepo:
             mkdir_p(target.parent)
             target.write_bytes(content)
 
-    def delete_scope_file(self, scope: dict, rel_path: str):
-        scope_path = scope["path"].strip("/")
-        base = self.current / scope_path if scope_path else self.current
+    def delete_scope_file(self, scope: dict, rel_path: str) -> None:
+        scope_path = normalize_path(scope["path"])
+        base = _scope_base(self.current, scope_path)
         target = base / rel_path
         if target.exists():
             target.unlink()
@@ -264,7 +277,7 @@ class ServerRepo:
         return self._build_tree_from_files(files)
 
     def _build_tree_from_files(self, files: dict) -> str:
-        nested = {}
+        nested: dict = {}
         for path, content in files.items():
             parts = path.split("/")
             d = nested
@@ -275,7 +288,7 @@ class ServerRepo:
         return self._write_nested_tree(nested)
 
     def _write_nested_tree(self, node: dict) -> str:
-        entries = {}
+        entries: dict = {}
         for name, val in sorted(node.items()):
             if isinstance(val, tuple):
                 entries[name] = list(val)

@@ -1,19 +1,25 @@
-"""Three-way merge engine with layered conflict resolution.
+"""Three-way merge engine with pluggable conflict resolution strategies.
 
-Strategy stack (tried in order):
+Strategy stack (tried in order by DefaultResolver):
   1. Identical — both sides made the same change → trivial
   2. One-side-only — only one side changed → take that side
   3. Line-level merge — both changed different lines → auto-merge
   4. JSON merge — both changed different keys → auto-merge
   5. LWW (Last-Writer-Wins) — take the incoming change, log the loss
 
-Every merge produces a MergeResult with the merged content and
-a list of conflict records for audit.
+The strategy chain is configurable: create a ConflictResolver with a
+custom list of MergeStrategy instances to change the order or inject
+domain-specific strategies (e.g. LLM-assisted merge).
 """
 
+from __future__ import annotations
+
+import abc
 import json
 from dataclasses import dataclass, field
 
+
+# ── Data types ─────────────────────────────────
 
 @dataclass
 class ConflictRecord:
@@ -27,49 +33,192 @@ class ConflictRecord:
 @dataclass
 class MergeResult:
     content: bytes
-    conflicts: list = field(default_factory=list)  # list[ConflictRecord]
+    conflicts: list[ConflictRecord] = field(default_factory=list)
     strategy: str = "identical"
 
 
-def three_way_merge(base: bytes, ours: bytes, theirs: bytes,
-                    path: str = "") -> MergeResult:
-    """Merge two versions against a common base. Never fails — LWW is the fallback."""
+# ── Strategy interface ─────────────────────────
 
-    if ours == theirs:
-        return MergeResult(content=ours, strategy="identical")
+class MergeStrategy(abc.ABC):
+    """A single merge strategy. Returns MergeResult or None to pass."""
 
-    if base == ours:
-        return MergeResult(content=theirs, strategy="theirs_only")
+    name: str = "base"
 
-    if base == theirs:
-        return MergeResult(content=ours, strategy="ours_only")
+    @abc.abstractmethod
+    def try_merge(self, base: bytes, ours: bytes, theirs: bytes,
+                  path: str) -> MergeResult | None:
+        """Attempt to merge. Return None to defer to the next strategy."""
 
-    # Both sides changed — try structured merge
-    if path.endswith(".json"):
-        result = _try_json_merge(base, ours, theirs, path)
-        if result is not None:
-            return result
 
-    result = _try_line_merge(base, ours, theirs, path)
-    if result is not None:
-        return result
+# ── Built-in strategies ───────────────────────
 
-    # Fallback: Last-Writer-Wins (theirs = incoming push wins)
-    return MergeResult(
-        content=theirs,
-        strategy="lww",
-        conflicts=[ConflictRecord(
-            path=path,
+class IdenticalStrategy(MergeStrategy):
+    name = "identical"
+
+    def try_merge(self, base: bytes, ours: bytes, theirs: bytes,
+                  path: str) -> MergeResult | None:
+        if ours == theirs:
+            return MergeResult(content=ours, strategy="identical")
+        return None
+
+
+class OneSideOnlyStrategy(MergeStrategy):
+    name = "one_side_only"
+
+    def try_merge(self, base: bytes, ours: bytes, theirs: bytes,
+                  path: str) -> MergeResult | None:
+        if base == ours:
+            return MergeResult(content=theirs, strategy="theirs_only")
+        if base == theirs:
+            return MergeResult(content=ours, strategy="ours_only")
+        return None
+
+
+class LineMergeStrategy(MergeStrategy):
+    name = "line_merge"
+
+    def try_merge(self, base: bytes, ours: bytes, theirs: bytes,
+                  path: str) -> MergeResult | None:
+        return _try_line_merge(base, ours, theirs, path)
+
+
+class JsonMergeStrategy(MergeStrategy):
+    name = "json_merge"
+
+    def try_merge(self, base: bytes, ours: bytes, theirs: bytes,
+                  path: str) -> MergeResult | None:
+        if path.endswith(".json"):
+            return _try_json_merge(base, ours, theirs, path)
+        return None
+
+
+class LWWStrategy(MergeStrategy):
+    """Last-Writer-Wins fallback — incoming push always wins."""
+    name = "lww"
+
+    def try_merge(self, base: bytes, ours: bytes, theirs: bytes,
+                  path: str) -> MergeResult | None:
+        return MergeResult(
+            content=theirs,
             strategy="lww",
-            detail="both sides modified, theirs (incoming push) wins",
-            kept="theirs",
-            lost_content=ours.decode(errors="replace")[:500],
-        )],
-    )
+            conflicts=[ConflictRecord(
+                path=path,
+                strategy="lww",
+                detail="both sides modified, theirs (incoming push) wins",
+                kept="theirs",
+                lost_content=ours.decode(errors="replace")[:500],
+            )],
+        )
 
+
+# ── Default strategy order ─────────────────────
+DEFAULT_STRATEGIES: list[MergeStrategy] = [
+    IdenticalStrategy(),
+    OneSideOnlyStrategy(),
+    JsonMergeStrategy(),
+    LineMergeStrategy(),
+    LWWStrategy(),
+]
+
+
+# ── Resolver (strategy chain) ─────────────────
+
+class ConflictResolver:
+    """Runs a chain of MergeStrategy instances until one succeeds.
+
+    The default chain matches the original five-layer strategy.
+    Pass a custom strategies list to change the order or inject
+    domain-specific strategies.
+    """
+
+    def __init__(self, strategies: list[MergeStrategy] | None = None):
+        self.strategies = strategies if strategies is not None else list(DEFAULT_STRATEGIES)
+
+    def resolve(self, base: bytes, ours: bytes, theirs: bytes,
+                path: str = "") -> MergeResult:
+        for strategy in self.strategies:
+            result = strategy.try_merge(base, ours, theirs, path)
+            if result is not None:
+                return result
+        # Should never reach here because LWW always succeeds,
+        # but guard against misconfigured chains.
+        return LWWStrategy().try_merge(base, ours, theirs, path)
+
+
+# Module-level default resolver
+_default_resolver = ConflictResolver()
+
+
+# ── Public API (backward-compatible) ──────────
+
+def three_way_merge(base: bytes, ours: bytes, theirs: bytes,
+                    path: str = "",
+                    resolver: ConflictResolver | None = None) -> MergeResult:
+    """Merge two versions against a common base. Never fails — LWW is the fallback."""
+    r = resolver or _default_resolver
+    return r.resolve(base, ours, theirs, path)
+
+
+def merge_file_sets(base_files: dict, our_files: dict, their_files: dict,
+                    resolver: ConflictResolver | None = None) -> tuple:
+    """Merge two sets of files against a common base.
+
+    Args:
+        base_files:  {path: bytes} at the common ancestor version
+        our_files:   {path: bytes} currently on server
+        their_files: {path: bytes} incoming from agent push
+        resolver:    optional custom ConflictResolver
+
+    Returns:
+        (merged_files: {path: bytes}, all_conflicts: [ConflictRecord])
+    """
+    merged: dict[str, bytes] = {}
+    all_conflicts: list[ConflictRecord] = []
+    all_paths = set(base_files) | set(our_files) | set(their_files)
+
+    for path in sorted(all_paths):
+        base = base_files.get(path, b"")
+        ours = our_files.get(path)
+        theirs = their_files.get(path)
+
+        if ours is None and theirs is None:
+            continue  # both deleted
+
+        if ours is None:
+            # We deleted, they kept/modified
+            if theirs != base:
+                merged[path] = theirs
+                all_conflicts.append(ConflictRecord(
+                    path=path, strategy="delete_modify",
+                    detail="ours deleted, theirs modified → keep theirs",
+                    kept="theirs",
+                ))
+            # else: both effectively removed
+            continue
+
+        if theirs is None:
+            # They deleted, we kept/modified
+            if ours != base:
+                merged[path] = ours
+                all_conflicts.append(ConflictRecord(
+                    path=path, strategy="modify_delete",
+                    detail="theirs deleted, ours modified → keep ours",
+                    kept="ours",
+                ))
+            # else: both effectively removed
+            continue
+
+        result = three_way_merge(base, ours, theirs, path, resolver)
+        merged[path] = result.content
+        all_conflicts.extend(result.conflicts)
+
+    return merged, all_conflicts
+
+
+# ── Private helpers (line / JSON merge) ────────
 
 def _try_line_merge(base: bytes, ours: bytes, theirs: bytes,
-                    path: str) -> MergeResult:
+                    path: str) -> MergeResult | None:
     """Line-level three-way merge using LCS-based diff. Returns None on conflict."""
     try:
         base_lines = base.decode().splitlines(keepends=True)
@@ -139,7 +288,7 @@ def _apply_hunks(base: list, hunks_a: list, hunks_b: list) -> list:
 
 
 def _try_json_merge(base: bytes, ours: bytes, theirs: bytes,
-                    path: str) -> MergeResult:
+                    path: str) -> MergeResult | None:
     """JSON key-level merge. Returns None if it can't parse or conflicts."""
     try:
         base_obj = json.loads(base)
@@ -164,105 +313,55 @@ def _merge_dicts(base: dict, ours: dict, theirs: dict,
                  path: str) -> tuple:
     """Recursively merge two dicts against a base. Returns (merged_dict, conflicts)."""
     merged = dict(base)
-    conflicts = []
-    all_keys = set(base) | set(ours) | set(theirs)
+    conflicts: list[ConflictRecord] = []
 
-    for key in all_keys:
-        b_val = base.get(key)
-        o_val = ours.get(key)
-        t_val = theirs.get(key)
+    for key in set(base) | set(ours) | set(theirs):
+        b_val, o_val, t_val = base.get(key), ours.get(key), theirs.get(key)
+        action, conflict = _merge_key(b_val, o_val, t_val, key, path)
 
-        if o_val == t_val:
-            if o_val is None and key in merged:
-                del merged[key]
-            elif o_val is not None:
-                merged[key] = o_val
-            continue
+        if action == "delete":
+            merged.pop(key, None)
+        elif action is not None:
+            merged[key] = action
 
-        if b_val == o_val:
-            if t_val is None:
-                merged.pop(key, None)
-            else:
-                merged[key] = t_val
-            continue
-
-        if b_val == t_val:
-            if o_val is None:
-                merged.pop(key, None)
-            else:
-                merged[key] = o_val
-            continue
-
-        # Both changed this key differently
-        if (isinstance(o_val, dict) and isinstance(t_val, dict)
-                and isinstance(b_val, dict)):
-            sub_merged, sub_conflicts = _merge_dicts(b_val, o_val, t_val,
-                                                      f"{path}/{key}")
-            merged[key] = sub_merged
-            conflicts.extend(sub_conflicts)
-        else:
-            # LWW at key level: theirs wins
-            merged[key] = t_val if t_val is not None else o_val
-            conflicts.append(ConflictRecord(
-                path=f"{path}#{key}",
-                strategy="json_lww",
-                detail=f"both modified key '{key}'",
-                kept="theirs",
-                lost_content=json.dumps(o_val)[:200] if o_val != t_val else "",
-            ))
+        if conflict is not None:
+            conflicts.extend(conflict) if isinstance(conflict, list) else conflicts.append(conflict)
 
     return merged, conflicts
 
 
-def merge_file_sets(base_files: dict, our_files: dict, their_files: dict) -> tuple:
-    """Merge two sets of files against a common base.
+def _merge_key(b_val, o_val, t_val, key: str, path: str):
+    """Resolve a single key in a dict merge.
 
-    Args:
-        base_files:  {path: bytes} at the common ancestor version
-        our_files:   {path: bytes} currently on server
-        their_files: {path: bytes} incoming from agent push
-
-    Returns:
-        (merged_files: {path: bytes}, all_conflicts: [ConflictRecord])
+    Returns (value_or_action, conflict_or_none).
+    value_or_action: the merged value, "delete" to remove the key, or None for no-op.
     """
-    merged = {}
-    all_conflicts = []
-    all_paths = set(base_files) | set(our_files) | set(their_files)
+    # Both sides agree
+    if o_val == t_val:
+        if o_val is None:
+            return "delete", None
+        return o_val, None
 
-    for path in sorted(all_paths):
-        base = base_files.get(path, b"")
-        ours = our_files.get(path)
-        theirs = their_files.get(path)
+    # Only theirs changed
+    if b_val == o_val:
+        return ("delete" if t_val is None else t_val), None
 
-        if ours is None and theirs is None:
-            continue  # both deleted
+    # Only ours changed
+    if b_val == t_val:
+        return ("delete" if o_val is None else o_val), None
 
-        if ours is None:
-            # We deleted, they kept/modified
-            if theirs != base:
-                merged[path] = theirs
-                all_conflicts.append(ConflictRecord(
-                    path=path, strategy="delete_modify",
-                    detail="ours deleted, theirs modified → keep theirs",
-                    kept="theirs",
-                ))
-            # else: both effectively removed
-            continue
+    # Both changed — try recursive dict merge
+    if all(isinstance(v, dict) for v in (b_val, o_val, t_val)):
+        sub_merged, sub_conflicts = _merge_dicts(b_val, o_val, t_val, f"{path}/{key}")
+        return sub_merged, sub_conflicts
 
-        if theirs is None:
-            # They deleted, we kept/modified
-            if ours != base:
-                merged[path] = ours
-                all_conflicts.append(ConflictRecord(
-                    path=path, strategy="modify_delete",
-                    detail="theirs deleted, ours modified → keep ours",
-                    kept="ours",
-                ))
-            # else: both effectively removed
-            continue
-
-        result = three_way_merge(base, ours, theirs, path)
-        merged[path] = result.content
-        all_conflicts.extend(result.conflicts)
-
-    return merged, all_conflicts
+    # LWW at key level: theirs wins
+    winner = t_val if t_val is not None else o_val
+    conflict = ConflictRecord(
+        path=f"{path}#{key}",
+        strategy="json_lww",
+        detail=f"both modified key '{key}'",
+        kept="theirs",
+        lost_content=json.dumps(o_val)[:200] if o_val != t_val else "",
+    )
+    return winner, conflict
