@@ -20,13 +20,8 @@ PROTOCOL_VERSION = 1
 
 # ── Helpers ────────────────────────────────────
 
-def normalize_path(path: str) -> str:
-    """Canonical path normalization used everywhere in Mut.
-
-    Strips leading/trailing slashes so that scope paths, file paths,
-    and exclude lists can be compared consistently.
-    """
-    return path.strip("/")
+# Re-export from canonical location for backwards compatibility
+from mut.foundation.config import normalize_path  # noqa: F401
 
 
 # ── Clone ──────────────────────────────────────

@@ -18,6 +18,8 @@ import abc
 import json
 from dataclasses import dataclass, field
 
+from mut.foundation.hash import hash_bytes
+
 
 # ── Data types ─────────────────────────────────
 
@@ -27,7 +29,8 @@ class ConflictRecord:
     strategy: str           # "line_merge", "json_merge", "lww", etc.
     detail: str = ""
     kept: str = ""          # which side was kept ("ours", "theirs", "merged")
-    lost_content: str = ""  # content that was overwritten (for audit)
+    lost_content: str = ""  # preview of overwritten content (for display)
+    lost_hash: str = ""     # hash of full lost content in object store (for recovery)
 
 
 @dataclass
@@ -98,6 +101,8 @@ class LWWStrategy(MergeStrategy):
 
     def try_merge(self, base: bytes, ours: bytes, theirs: bytes,
                   path: str) -> MergeResult | None:
+        ours_hash = hash_bytes(ours)
+        ours_preview = ours.decode(errors="replace")[:500]
         return MergeResult(
             content=theirs,
             strategy="lww",
@@ -106,7 +111,8 @@ class LWWStrategy(MergeStrategy):
                 strategy="lww",
                 detail="both sides modified, theirs (incoming push) wins",
                 kept="theirs",
-                lost_content=ours.decode(errors="replace")[:500],
+                lost_content=ours_preview,
+                lost_hash=ours_hash,
             )],
         )
 
@@ -357,11 +363,13 @@ def _merge_key(b_val, o_val, t_val, key: str, path: str):
 
     # LWW at key level: theirs wins
     winner = t_val if t_val is not None else o_val
+    lost_val = json.dumps(o_val)
     conflict = ConflictRecord(
         path=f"{path}#{key}",
         strategy="json_lww",
         detail=f"both modified key '{key}'",
         kept="theirs",
-        lost_content=json.dumps(o_val)[:200] if o_val != t_val else "",
+        lost_content=lost_val[:500],
+        lost_hash=hash_bytes(lost_val.encode()) if o_val != t_val else "",
     )
     return winner, conflict

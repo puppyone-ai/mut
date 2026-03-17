@@ -10,7 +10,7 @@ A scope defines which directory subtree an agent can access:
   }
 """
 
-from mut.core.protocol import normalize_path
+from mut.foundation.config import normalize_path
 
 
 def check_path_permission(scope: dict, file_path: str, action: str = "read") -> bool:

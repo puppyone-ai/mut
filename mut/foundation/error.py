@@ -13,54 +13,54 @@ class MutError(Exception):
 
 class NotARepoError(MutError):
     """Raised when operating outside a .mut/ repository."""
-    http_status: int = 400
+    http_status = 400
 
 
 class SnapshotNotFoundError(MutError):
     """Raised when a requested snapshot ID does not exist."""
-    http_status: int = 404
+    http_status = 404
 
 
 class ObjectNotFoundError(MutError):
     """Raised when a hash-addressed object is missing from the store."""
-    http_status: int = 404
-
-
-class PermissionDenied(MutError):
-    """Raised when an agent tries to access outside its scope."""
-    http_status: int = 403
+    http_status = 404
 
 
 class AuthenticationError(MutError):
     """Raised on invalid / expired / missing auth tokens."""
-    http_status: int = 401
+    http_status = 401
 
 
-class ConflictError(MutError):
-    """Raised when a merge conflict cannot be auto-resolved."""
-    http_status: int = 409
+class PermissionDenied(MutError):
+    """Raised when an agent tries to access outside its scope."""
+    http_status = 403
 
 
 class LockError(MutError):
     """Raised when a scope lock cannot be acquired."""
-    http_status: int = 409
+    http_status = 409
+
+
+class ConflictError(MutError):
+    """Raised when a merge conflict cannot be auto-resolved."""
+    http_status = 409
 
 
 class DirtyWorkdirError(MutError):
     """Raised when pull would overwrite uncommitted local changes."""
-    http_status: int = 400
+    http_status = 400
 
 
 class NetworkError(MutError):
     """Raised on server communication failures."""
-    http_status: int = 502
+    http_status = 502
 
 
 class PayloadTooLargeError(MutError):
     """Raised when request body exceeds the size limit."""
-    http_status: int = 413
+    http_status = 413
 
 
 class ValidationError(MutError):
     """Raised when request data fails schema/semantic validation."""
-    http_status: int = 422
+    http_status = 422

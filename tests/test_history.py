@@ -119,4 +119,4 @@ class TestRedactForScope:
 
     def test_no_changes_key(self):
         entry = {"id": 1}
-        assert _redact_for_scope(entry, "src") is entry  # same object
+        assert _redact_for_scope(entry, "src") == entry  # same content, root stripped
