@@ -67,7 +67,7 @@ Mut has two components that run separately:
 ### 1. Install
 
 ```bash
-pip install .
+pip install git+https://github.com/puppyone-ai/mut.git
 ```
 
 This installs both `mut` (client) and `mut-server` (server) commands.
