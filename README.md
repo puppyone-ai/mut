@@ -71,17 +71,17 @@ You have two [OpenClaw](https://github.com/openclawx/openclaw) agents. Agent A h
 ```
 ┌─────────────────┐           ┌─────────────────────┐
 │  OpenClaw #1    │  push →   │  Server             │
-│  workspace-1/   │  ← pull   │  project/           │
-│  ├── convos/    │           │  ├── convos/        │
-│  ├── reports/   │           │  ├── reports/       │
-│  └── .mut/      │           │  └── .mut-server/   │
-└─────────────────┘           │                     │
-                              │                     │
-┌─────────────────┐           │                     │
+│  workspace-1/   │  ← pull   │  ├── workspace-1/   │
+│  ├── convos/    │           │  │   ├── convos/    │
+│  └── reports/   │           │  │   └── reports/   │
+│  └── .mut/      │           │  ├── workspace-2/   │
+└─────────────────┘           │  │   ├── tasks/     │
+                              │  │   └── logs/      │
+┌─────────────────┐           │  └── .mut-server/   │
 │  OpenClaw #2    │  push →   │                     │
 │  workspace-2/   │  ← pull   │                     │
-│  ├── convos/    │           │                     │
-│  ├── reports/   │           │                     │
+│  ├── tasks/     │           │                     │
+│  └── logs/      │           │                     │
 │  └── .mut/      │           │                     │
 └─────────────────┘           └─────────────────────┘
 ```
