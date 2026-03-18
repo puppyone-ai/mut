@@ -4,53 +4,104 @@
 
 # Mut
 
-Version control for AI agent context.
+Mut is version control for context - built for multi-agent collaboration.
 
-Centralized, folder-level isolation for multiple agents. Server is the source of truth. No conflicts, no failed commits.
+- **Centralized context** — the server holds the single source of truth. All agents push to and pull from one place. No diverging copies, no conflicts.
+- **Per-agent scopes** — each agent has its own scope (e.g. Agent A on `/src/`, Agent B on `/docs/`). Agents collaborate on the same project, but each one only sees and writes the context it's permitted to access.
 
-## Why Not Git?
+## Old World vs New World
 
-Git works great for humans. For AI agents, two problems keep coming up:
-
-1. **Conflicts break the flow.** Multiple agents editing the same repo means frequent merge conflicts. Each conflict needs a human to step in, resolve `<<<< ====` markers, and restart the agent — shattering its context and momentum.
-
-2. **No per-agent permissions.** You can't scope what each agent is allowed to touch. Git gives full repo access — there's no way to say "Agent A can only write to `/src/`, Agent B can only write to `/docs/`." Every agent can read and overwrite everything.
-
-Mut solves both by design:
-
-| | Git | Mut |
+| | Old World (Git) | New World (Mut) |
 |---|---|---|
-| **Conflicts** | Human resolves manually | Server auto-merges; LWW fallback — commits never fail |
-| **Permissions** | Full repo access once cloned | Token-scoped, path-level read/write ACL |
-| **Architecture** | Decentralized | Centralized — server is the source of truth |
-| **Designed for** | Humans + branches + PRs | AI agents + scopes + auto-merge |
+| **For whom** |  Humans | AI Agents |
+| **Branches** | Decentralized — every branch is equal, no single truth | Centralized — one source-of-truth branch, agents sync from it |
+| **Conflicts** | Surface on merge / push — require human resolution | Auto-resolved by the server — push never fails |
+| **Access** | All developers see the full repo | Each agent only sees the files within its scope |
+
+### 1. One Source of Truth, Not Scattered Branches
+
+**Old World (Git)**
+
+Two agents update the same `customers.json` — one collects from calls, the other from emails. Each works on its own branch. Which branch has the full list? Neither. The data splits, conflicts follow.
+
+**New World (Mut)**
+
+There's one context on the server. Both agents push to the same place. The server merges automatically. No branches to choose from, no data drift.
+
+### 2. Per-Agent Scopes, Not Full Access
+
+**Old World (Git)**
+
+A company runs two agents on the same project: a customer-facing chatbot that reads product docs, and an internal BI agent that reads financial reports. Both get full repo access — the chatbot can see revenue numbers, the BI agent can overwrite customer content. Sensitive data leaks across boundaries that should never be crossed.
+
+**New World (Mut)**
+
+Each agent gets a scope. The chatbot reads `/docs/`, the BI agent reads `/reports/`. Same project, naturally isolated.
+
 
 ## Quick Start
 
-### Server
+### Architecture Overview
+
+Mut has two components that run separately:
+
+- **Server** (`mut-server`) — the centralized source of truth. Hosts the project context and handles merges. Typically runs on a dedicated machine or cloud instance so all agents can reach it.
+- **Client** (`mut`) — runs wherever your agent runs. Clones the context, commits changes locally, and pushes/pulls to/from the server.
+
+```
+┌─────────────┐           ┌─────────────────┐
+│  Agent A    │  push →   │                 │
+│  (client)   │  ← pull   │                 │
+└─────────────┘           │                 │
+  Your machine            │   source of     │
+                          │   truth         │
+┌─────────────┐           │   (server)      │
+│  Agent B    │  push →   │                 │
+│  (client)   │  ← pull   │                 │
+└─────────────┘           └─────────────────┘
+  Your machine                  Cloud
+```
+
+> **Note:** The server needs to be reachable by all agents. If you're running agents on Open Cloud or remote services, deploy the server to a machine with a public IP or domain.
+
+### 1. Install
+
+```bash
+pip install .
+```
+
+This installs both `mut` (client) and `mut-server` (server) commands.
+
+### 2. Source of Truth (Server)
+
+Run these on the machine that will host the source of truth:
 
 ```bash
 # Initialize a project
 mut-server init ./my-project --name my-project
 
-# Create an invite link for agents
-mut-server create-invite ./my-project --scope-path "/src/" --host localhost --port 9742
+# Create a scope and assign an agent
+mut-server add-scope ./my-project --id scope-src --scope-path "/src/"
+mut-server issue-credential ./my-project --scope scope-src --agent agent-1 --mode rw
+# → prints a credential key, save it for the agent
 
 # Start the server
 mut-server serve ./my-project --port 9742
 ```
 
-### Agent
+### 2. Agent (Client)
+
+Run these wherever your agent lives:
 
 ```bash
-# One command: register + clone (auto-creates my-project/ directory)
-mut clone http://localhost:9742/invite/<invite-id>
+# Clone the project context (use the credential from server setup)
+mut clone http://<server-host>:9742 --credential <CREDENTIAL>
 
 # Work normally
 cd my-project
 echo 'print("hello")' > app.py
 
-# Commit and push — no -w flag needed, agent ID is automatic
+# Commit and push
 mut commit -m "add app"
 mut push
 
@@ -58,24 +109,6 @@ mut push
 mut pull
 ```
 
-## How It Works
-
-```
-Agent A (scope: /src/)          Server              Agent B (scope: /docs/)
-┌──────────────┐          ┌──────────────┐          ┌──────────────┐
-│ src/          │  push →  │ current/     │  ← push  │ docs/        │
-│   app.py      │          │   src/       │          │   readme.md  │
-│   utils.py    │          │     app.py   │          │   api.md     │
-│ .mut/         │  ← pull  │     utils.py │  pull →  │ .mut/        │
-│   objects/    │          │   docs/      │          │   objects/   │
-│   snapshots   │          │     readme.md│          │   snapshots  │
-└──────────────┘          │     api.md   │          └──────────────┘
-                          │ .mut-server/ │
-                          │   objects/   │
-                          │   scopes/    │
-                          │   history/   │
-                          └──────────────┘
-```
 
 **Core concepts:**
 
@@ -114,42 +147,6 @@ Agent A (scope: /src/)          Server              Agent B (scope: /docs/)
 | `mut-server issue-token <path>` | Manually issue an API key |
 | `mut-server serve <path>` | Start the HTTP server |
 
-## Project Structure
-
-```
-mut/
-├── cli.py                 # Agent CLI
-├── core/                  # Core data structures
-│   ├── object_store.py    #   Content-addressable blob/tree storage
-│   ├── tree.py            #   Merkle tree operations
-│   ├── snapshot.py        #   Commit chain
-│   ├── merge.py           #   Three-way merge engine
-│   ├── diff.py            #   Tree/manifest comparison
-│   ├── scope.py           #   Path permission checks
-│   └── auth.py            #   JWT-style token signing
-├── ops/                   # CLI operations
-│   ├── clone_op.py        #   mut clone
-│   ├── commit_op.py       #   mut commit
-│   ├── push_op.py         #   mut push / pull
-│   └── ...
-├── foundation/            # Low-level utilities
-│   ├── hash.py            #   SHA-256 hashing
-│   ├── fs.py              #   Atomic writes, file locks
-│   ├── transport.py       #   HTTP client (stdlib only)
-│   └── credentials.py     #   Local API key storage
-└── server/                # Server components
-    ├── server.py           #   HTTP API
-    ├── graft.py            #   Subtree grafting engine
-    ├── repo.py             #   Server repository management
-    └── ...
-```
-
-Four layers, dependencies go strictly downward:
-
-```
-CLI → Operations → Core → Foundation
-                   Server ↗
-```
 
 ## Requirements
 
