@@ -45,24 +45,48 @@ Each agent gets a scope. The chatbot reads `/docs/`, the BI agent reads `/report
 
 Mut has two components that run separately:
 
-- **Server** (`mut-server`) — the centralized source of truth. Hosts the project context and handles merges. Typically runs on a dedicated machine or cloud instance so all agents can reach it.
-- **Client** (`mut`) — runs wherever your agent runs. Clones the context, commits changes locally, and pushes/pulls to/from the server.
+- **Server** (`mut-server`) — the centralized source of truth. Hosts the project context and handles merges. Typically runs on a dedicated machine or cloud instance so all agents can reach it. Creates a `.mut-server/` directory to store objects, scopes, and history.
+- **Client** (`mut`) — runs wherever your agent runs. Clones the context, commits changes locally, and pushes/pulls to/from the server. Creates a `.mut/` directory inside your workspace to track local state.
 
 ```
 ┌─────────────┐           ┌─────────────────┐
 │  Agent A    │  push →   │                 │
-│  (client)   │  ← pull   │                 │
-└─────────────┘           │                 │
-  Your machine            │   source of     │
-                          │   truth         │
-┌─────────────┐           │   (server)      │
+│  (client)   │  ← pull   │     Server      │
+└─────────────┘           │  (source of     │
+                          │   truth)        │
+┌─────────────┐           │                 │
 │  Agent B    │  push →   │                 │
 │  (client)   │  ← pull   │                 │
 └─────────────┘           └─────────────────┘
-  Your machine                  Cloud
 ```
 
-> **Note:** The server needs to be reachable by all agents. If you're running agents on Open Cloud or remote services, deploy the server to a machine with a public IP or domain.
+### Example: Two OpenClaw Agents Sharing Context
+
+You have two [OpenClaw](https://github.com/openclawx/openclaw) agents. Agent A handles customer conversations via WhatsApp. Agent B runs BI analysis on internal data. Each has its own workspace folder — that folder is its context.
+
+**Without Mut:** Each OpenClaw workspace is a plain folder — no version history, no rollback. If an agent corrupts a file, it's gone. You can't see what all your agents are working on in one place. There's no way to govern or audit agent context across machines.
+
+**With Mut:** You run `mut-server` on a VPS (or one of the machines) as the single source of truth. Every change is versioned — you can roll back anytime. All agent context is visible in one place. With scopes, Agent A can only write to `/conversations/`, Agent B can only write to `/reports/`. Version control, visibility, and governance — built in.
+
+```
+┌─────────────────┐           ┌─────────────────────┐
+│  OpenClaw #1    │  push →   │  Server             │
+│  workspace-1/   │  ← pull   │  project/           │
+│  ├── convos/    │           │  ├── convos/        │
+│  ├── reports/   │           │  ├── reports/       │
+│  └── .mut/      │           │  └── .mut-server/   │
+└─────────────────┘           │                     │
+                              │                     │
+┌─────────────────┐           │                     │
+│  OpenClaw #2    │  push →   │                     │
+│  workspace-2/   │  ← pull   │                     │
+│  ├── convos/    │           │                     │
+│  ├── reports/   │           │                     │
+│  └── .mut/      │           │                     │
+└─────────────────┘           └─────────────────────┘
+```
+
+> **Tip:** For local development or testing, you can run both `mut-server` and `mut` on the same machine — the server just uses a local folder as its store.
 
 ### 1. Install
 
@@ -72,41 +96,57 @@ pip install git+https://github.com/puppyone-ai/mut.git
 
 This installs both `mut` (client) and `mut-server` (server) commands.
 
-### 2. Source of Truth (Server)
+### 2. Setup (One-Time)
 
-Run these on the machine that will host the source of truth:
+**Server — on the machine that hosts the source of truth:**
 
 ```bash
-# Initialize a project
 mut-server init ./my-project --name my-project
-
-# Create a scope and assign an agent
 mut-server add-scope ./my-project --id scope-src --scope-path "/src/"
 mut-server issue-credential ./my-project --scope scope-src --agent agent-1 --mode rw
 # → prints a credential key, save it for the agent
-
-# Start the server
 mut-server serve ./my-project --port 9742
 ```
 
-### 2. Agent (Client)
-
-Run these wherever your agent lives:
+**Client — on the machine where your agent runs:**
 
 ```bash
-# Clone the project context (use the credential from server setup)
 mut clone http://<server-host>:9742 --credential <CREDENTIAL>
+```
 
-# Work normally
-cd my-project
-echo 'print("hello")' > app.py
+Done. The agent now has a local copy of the context in `my-project/`.
 
-# Commit and push
-mut commit -m "add app"
+### 3. Daily Usage
+
+**Sync local changes to server:**
+
+```bash
+mut commit -m "update customer records"
 mut push
+```
 
-# Pull changes from other agents
+**Pull latest context from server (other agents' changes):**
+
+```bash
 mut pull
+```
+
+**Check what changed locally:**
+
+```bash
+mut status
+```
+
+**View history:**
+
+```bash
+mut log
+```
+
+**Roll back to a previous version:**
+
+```bash
+mut checkout <snapshot-id>
 ```
 
 
