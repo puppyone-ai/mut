@@ -295,12 +295,12 @@ JSONEOF
 
 # Create agents (6 agents sharing /docs/)
 for i in $(seq 1 6); do
-    $MUT_SERVER add-scope "$SERVER_DIR" --id "scope-$i" --scope-path "/docs/" --agents "agent-$i" --mode rw 2>/dev/null
+    $MUT_SERVER add-scope "$SERVER_DIR" --id "scope-$i" --scope-path "/docs/" 2>/dev/null
 done
 
-declare -a TOKENS
+declare -a CREDS
 for i in $(seq 1 6); do
-    TOKENS[$i]=$($MUT_SERVER issue-token "$SERVER_DIR" --agent "agent-$i")
+    CREDS[$i]=$($MUT_SERVER issue-credential "$SERVER_DIR" --scope "scope-$i" --agent "agent-$i" --mode rw)
 done
 
 $MUT_SERVER serve "$SERVER_DIR" --port $PORT &
@@ -316,7 +316,7 @@ echo "--- Cloning 6 agents ---"
 for i in $(seq 1 6); do
     WDIR="$TESTDIR/w$i"
     mkdir -p "$WDIR" && cd "$WDIR"
-    $MUT clone "$SERVER_URL" --token "${TOKENS[$i]}" 2>/dev/null
+    $MUT clone "$SERVER_URL" --credential "${CREDS[$i]}" 2>/dev/null
     echo "  Agent-$i cloned"
 done
 

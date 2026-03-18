@@ -1,14 +1,17 @@
-"""Local credential storage for mut API keys.
+"""Local credential storage for Mut servers.
 
 Credentials are stored per-server in ~/.mut/credentials.json:
   {
     "http://server:9742": {
       "agent_id": "agent-abc123",
-      "token": "eyJ...",
+      "credential": "mut_a1b2c3...",
       "project": "my-project",
       "scope": "/src/"
     }
   }
+
+The credential is an opaque string — could be an API key, token, or
+anything the server's auth layer accepts.
 """
 
 from __future__ import annotations
@@ -23,19 +26,18 @@ CREDENTIALS_FILE = CREDENTIALS_DIR / "credentials.json"
 
 
 def _server_key(server_url: str) -> str:
-    """Normalize server URL to a consistent key (scheme + host + port)."""
     p = urlparse(server_url)
     port = p.port or (443 if p.scheme == "https" else 80)
     return f"{p.scheme}://{p.hostname}:{port}"
 
 
-def save_credential(server_url: str, agent_id: str, token: str,
+def save_credential(server_url: str, agent_id: str, credential: str,
                     project: str = "", scope: str = ""):
     CREDENTIALS_DIR.mkdir(parents=True, exist_ok=True)
     creds = load_all()
     creds[_server_key(server_url)] = {
         "agent_id": agent_id,
-        "token": token,
+        "credential": credential,
         "project": project,
         "scope": scope,
     }

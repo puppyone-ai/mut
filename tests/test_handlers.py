@@ -11,9 +11,8 @@ import pytest
 from mut.server.repo import ServerRepo
 from mut.server.handlers import (
     handle_clone, handle_push, handle_pull,
-    handle_negotiate, handle_register,
+    handle_negotiate,
 )
-from mut.core.auth import sign_token
 from mut.foundation.error import PermissionDenied, LockError
 
 
@@ -30,8 +29,10 @@ def server_repo(tmp_path):
 @pytest.fixture
 def rw_scope(server_repo):
     """Create an rw scope at /src/ for agent-A."""
-    server_repo.add_scope("scope-1", "/src/", ["agent-A"], "rw")
-    return server_repo.get_scope_for_agent("agent-A")
+    server_repo.add_scope("scope-1", "/src/")
+    scope = server_repo.scopes.get_by_id("scope-1")
+    scope["mode"] = "rw"  # mode comes from auth layer
+    return scope
 
 
 @pytest.fixture
@@ -136,8 +137,9 @@ class TestHandlePush:
         assert "main.py" in files
 
     def test_push_readonly_scope(self, server_repo):
-        server_repo.add_scope("ro-scope", "/docs/", ["agent-R"], "r")
-        scope = server_repo.get_scope_for_agent("agent-R")
+        server_repo.add_scope("ro-scope", "/docs/")
+        scope = server_repo.scopes.get_by_id("ro-scope")
+        scope["mode"] = "r"
         ro_auth = {"agent": "agent-R", "_scope": scope}
         with pytest.raises(PermissionDenied, match="read-only"):
             handle_push(server_repo, ro_auth, {})
@@ -216,17 +218,3 @@ class TestHandleNegotiate:
     def test_negotiate_empty(self, server_repo, auth):
         result = handle_negotiate(server_repo, auth, {"hashes": []})
         assert result["missing"] == []
-
-
-class TestHandleRegister:
-    def test_register_via_invite(self, server_repo):
-        invite = server_repo.create_invite("/src/", "rw")
-        result = handle_register(server_repo, invite["id"])
-        assert "agent_id" in result
-        assert "token" in result
-        assert result["project"] == "test-proj"
-        assert result["scope"]["path"] == "/src/"
-
-    def test_register_invalid_invite(self, server_repo):
-        with pytest.raises(ValueError, match="invalid"):
-            handle_register(server_repo, "nonexistent")

@@ -21,7 +21,6 @@ class TestServerRepoInit:
         assert (root / ".mut-server" / "history").is_dir()
         assert (root / ".mut-server" / "locks").is_dir()
         assert (root / ".mut-server" / "audit").is_dir()
-        assert (root / ".mut-server" / "invites").is_dir()
 
     def test_double_init_fails(self, tmp_path):
         ServerRepo.init(str(tmp_path / "repo"))
@@ -31,24 +30,23 @@ class TestServerRepoInit:
     def test_project_name(self, server_repo):
         assert server_repo.get_project_name() == "test-project"
 
-    def test_secret_key_generated(self, server_repo):
-        secret = server_repo.get_secret()
-        assert len(secret) == 64  # 32 bytes hex
-
     def test_initial_version_zero(self, server_repo):
         assert server_repo.get_latest_version() == 0
 
 
 class TestServerRepoScopes:
     def test_add_and_get_scope(self, server_repo):
-        server_repo.add_scope("scope-1", "/src/", ["agent-A"], "rw")
-        scope = server_repo.get_scope_for_agent("agent-A")
+        server_repo.add_scope("scope-1", "/src/")
+        scope = server_repo.scopes.get_by_id("scope-1")
         assert scope is not None
+        assert scope["id"] == "scope-1"
         assert scope["path"] == "/src/"
-        assert scope["mode"] == "rw"
+        assert scope["exclude"] == []
 
-    def test_unknown_agent_returns_none(self, server_repo):
-        assert server_repo.get_scope_for_agent("nobody") is None
+    def test_add_scope_with_exclude(self, server_repo):
+        server_repo.add_scope("scope-2", "/docs/", exclude=["/docs/private/"])
+        scope = server_repo.scopes.get_by_id("scope-2")
+        assert scope["exclude"] == ["/docs/private/"]
 
 
 class TestServerRepoFiles:
@@ -117,35 +115,6 @@ class TestServerRepoLock:
         assert server_repo.acquire_lock("scope-1")
         assert not server_repo.acquire_lock("scope-1")
         server_repo.release_lock("scope-1")
-
-
-class TestServerRepoInvites:
-    def test_create_and_use_invite(self, server_repo):
-        server_repo.add_scope("init-scope", "/", ["placeholder"], "rw")
-        invite = server_repo.create_invite("/src/", "rw")
-        agent_id, token = server_repo.use_invite(invite["id"])
-        assert agent_id.startswith("agent-")
-        assert token
-
-    def test_invalid_invite(self, server_repo):
-        with pytest.raises(ValueError, match="invalid"):
-            server_repo.use_invite("nonexistent")
-
-    def test_invite_max_uses(self, server_repo):
-        invite = server_repo.create_invite("/src/", "rw", max_uses=1)
-        server_repo.use_invite(invite["id"])
-        with pytest.raises(ValueError, match="fully used"):
-            server_repo.use_invite(invite["id"])
-
-    def test_issue_token(self, server_repo):
-        server_repo.add_scope("s1", "/src/", ["agent-X"], "rw")
-        token = server_repo.issue_token("agent-X")
-        assert isinstance(token, str)
-        assert "." in token
-
-    def test_issue_token_unknown_agent(self, server_repo):
-        with pytest.raises(ValueError, match="no scope"):
-            server_repo.issue_token("nobody")
 
 
 class TestServerRepoHistory:

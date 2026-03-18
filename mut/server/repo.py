@@ -1,36 +1,32 @@
 """Server-side repository management with sync and async support.
 
-Bug fix: async methods use asyncio.Lock for global version/root_hash
-writes, preventing race conditions when multiple scopes push concurrently.
+Manages the MUT protocol state: scopes, objects, history, and the
+current file tree. Auth is handled externally by an Authenticator.
 
 Server directory layout:
   /repo-root/
   ├── current/           ← live project files
   └── .mut-server/
       ├── config.json
-      ├── secret.key
       ├── objects/        ← full project object store
-      ├── scopes/         ← per-scope permission files
+      ├── scopes/         ← subtree boundary definitions
       ├── history/        ← per-version JSON records
       │   └── latest      ← current version number
       ├── audit/          ← append-only audit log
-      ├── locks/          ← atomic lock files
-      └── invites/        ← invite tokens
+      └── locks/          ← atomic lock files
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
-import secrets
 from pathlib import Path
 
 from mut.foundation.config import (
     MUT_SERVER_DIR, SERVER_OBJECTS_DIR, SERVER_CURRENT_DIR,
     SERVER_SCOPES_DIR, SERVER_HISTORY_DIR,
     SERVER_LOCKS_DIR, SERVER_LATEST_FILE, SERVER_ROOT_FILE,
-    SERVER_CONFIG_FILE, SECRET_KEY_FILE, SERVER_AUDIT_DIR,
-    SERVER_INVITES_DIR, BUILTIN_IGNORE, normalize_path,
+    SERVER_CONFIG_FILE, SERVER_AUDIT_DIR, BUILTIN_IGNORE, normalize_path,
 )
 from mut.foundation.fs import (
     read_json, write_json, write_text, mkdir_p,
@@ -42,14 +38,13 @@ from mut.foundation.fs import (
 from mut.core.object_store import ObjectStore
 from mut.core.ignore import IgnoreRules
 from mut.core import tree as tree_mod
-from mut.core.auth import sign_token
 from mut.server.scope_manager import ScopeManager
 from mut.server.history import HistoryManager
 from mut.server.audit import AuditLog
 
 
 class ServerRepo:
-    """Manages a server-side Mut repository."""
+    """Manages a server-side Mut repository (protocol state only, no auth)."""
 
     def __init__(self, repo_root: str):
         self.root = Path(repo_root).resolve()
@@ -61,12 +56,15 @@ class ServerRepo:
         self.history = HistoryManager(self.meta / SERVER_HISTORY_DIR)
         self.audit = AuditLog(self.meta / SERVER_AUDIT_DIR)
         self.locks_dir = self.meta / SERVER_LOCKS_DIR
-        self.invites_dir = self.meta / SERVER_INVITES_DIR
 
-        # Async locks for concurrent safety
-        self._global_lock = asyncio.Lock()      # protects version + root_hash
-        self._scope_locks: dict[str, asyncio.Lock] = {}  # per-scope push serialization
+        self._global_lock: asyncio.Lock | None = None
+        self._scope_locks: dict[str, asyncio.Lock] = {}
         self._MAX_SCOPE_LOCKS = 1000
+
+    def _ensure_global_lock(self) -> asyncio.Lock:
+        if self._global_lock is None:
+            self._global_lock = asyncio.Lock()
+        return self._global_lock
 
     def _get_scope_lock(self, scope_id: str) -> asyncio.Lock:
         """Get or create an asyncio.Lock for a scope, with lazy eviction."""
@@ -77,7 +75,6 @@ class ServerRepo:
         return self._scope_locks[scope_id]
 
     def _evict_idle_locks(self):
-        """Remove unlocked entries to prevent unbounded dict growth."""
         idle = [k for k, v in self._scope_locks.items() if not v.locked()]
         for k in idle:
             del self._scope_locks[k]
@@ -97,13 +94,8 @@ class ServerRepo:
         mkdir_p(meta / SERVER_HISTORY_DIR)
         mkdir_p(meta / SERVER_LOCKS_DIR)
         mkdir_p(meta / SERVER_AUDIT_DIR)
-        mkdir_p(meta / SERVER_INVITES_DIR)
 
         write_json(meta / SERVER_CONFIG_FILE, {"project": project_name})
-
-        secret = secrets.token_hex(32)
-        write_text(meta / SECRET_KEY_FILE, secret)
-
         write_text(meta / SERVER_HISTORY_DIR / SERVER_LATEST_FILE, "0")
         write_text(meta / SERVER_HISTORY_DIR / SERVER_ROOT_FILE, "")
 
@@ -111,115 +103,19 @@ class ServerRepo:
 
     def check_init(self):
         if not self.meta.exists():
-            raise FileNotFoundError("not a mut server repo (run 'mut-server init' first)")
+            raise FileNotFoundError(
+                "not a mut server repo (run 'mut-server init' first)"
+            )
 
     def get_project_name(self) -> str:
         cfg = read_json(self.meta / SERVER_CONFIG_FILE)
         return cfg.get("project", "project")
 
-    # ── Secret & Token ────────────────────────────
-
-    def get_secret(self) -> str:
-        return (self.meta / SECRET_KEY_FILE).read_text().strip()
-
-    def issue_token(self, agent_id: str, expiry_seconds: int = 0) -> str:
-        scope = self.scopes.get_for_agent(agent_id)
-        if scope is None:
-            raise ValueError(f"no scope configured for agent '{agent_id}'")
-        return sign_token(
-            self.get_secret(), agent_id, scope["path"], scope["mode"], expiry_seconds
-        )
-
-    # ── Invites ────────────────────────────────────
-
-    def create_invite(self, scope_path: str, mode: str = "rw",
-                      exclude: list | None = None, max_uses: int = 0) -> dict:
-        """Create an invite. max_uses=0 means unlimited."""
-        from datetime import datetime, timezone
-        invite_id = secrets.token_urlsafe(12)
-        invite = {
-            "id": invite_id,
-            "scope_path": scope_path,
-            "mode": mode,
-            "exclude": exclude or [],
-            "max_uses": max_uses,
-            "used": 0,
-            "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-        }
-        mkdir_p(self.invites_dir)
-        write_json(self.invites_dir / f"{invite_id}.json", invite)
-        return invite
-
-    def use_invite(self, invite_id: str) -> tuple[str, str]:
-        """Consume an invite: create scope + agent, return (agent_id, token)."""
-        path = self.invites_dir / f"{invite_id}.json"
-        if not path.exists():
-            raise ValueError("invalid invite")
-
-        invite = read_json(path)
-        if invite["max_uses"] > 0 and invite["used"] >= invite["max_uses"]:
-            raise ValueError("invite has been fully used")
-
-        agent_id = f"agent-{secrets.token_hex(4)}"
-        scope_id = f"scope-{secrets.token_hex(4)}"
-
-        self.add_scope(
-            scope_id, invite["scope_path"], [agent_id],
-            invite["mode"], invite["exclude"],
-        )
-        token = self.issue_token(agent_id)
-
-        invite["used"] += 1
-        write_json(path, invite)
-
-        self.record_audit("invite_used", agent_id, {
-            "invite_id": invite_id,
-            "scope_path": invite["scope_path"],
-        })
-
-        return agent_id, token
-
-    async def async_use_invite(self, invite_id: str) -> tuple[str, str]:
-        """Async: consume an invite."""
-        path = self.invites_dir / f"{invite_id}.json"
-        if not await async_exists(path):
-            raise ValueError("invalid invite")
-
-        invite = await async_read_json(path)
-        if invite["max_uses"] > 0 and invite["used"] >= invite["max_uses"]:
-            raise ValueError("invite has been fully used")
-
-        agent_id = f"agent-{secrets.token_hex(4)}"
-        scope_id = f"scope-{secrets.token_hex(4)}"
-
-        await self.scopes.async_add(
-            scope_id, invite["scope_path"], [agent_id],
-            invite["mode"], invite["exclude"],
-        )
-        # issue_token is sync (just HMAC), fine to call directly
-        token = self.issue_token(agent_id)
-
-        invite["used"] += 1
-        await async_write_json(path, invite)
-
-        await self.audit.async_record("invite_used", agent_id, {
-            "invite_id": invite_id,
-            "scope_path": invite["scope_path"],
-        })
-
-        return agent_id, token
-
     # ── Delegated scope access ────────────────────
 
-    def add_scope(self, scope_id: str, path: str, agents: list,
-                  mode: str = "rw", exclude: list | None = None) -> dict:
-        return self.scopes.add(scope_id, path, agents, mode, exclude)
-
-    def get_scope_for_agent(self, agent_id: str) -> dict | None:
-        return self.scopes.get_for_agent(agent_id)
-
-    async def async_get_scope_for_agent(self, agent_id: str) -> dict | None:
-        return await self.scopes.async_get_for_agent(agent_id)
+    def add_scope(self, scope_id: str, path: str,
+                  exclude: list | None = None) -> dict:
+        return self.scopes.add(scope_id, path, exclude)
 
     # ── Delegated history access ──────────────────
 
@@ -241,8 +137,9 @@ class ServerRepo:
         self.history.record(version, who, message, scope_path, changes,
                             conflicts, root_hash)
 
-    def get_history_since(self, since_version: int, scope_path: str | None = None,
-                           limit: int = 0) -> list:
+    def get_history_since(self, since_version: int,
+                          scope_path: str | None = None,
+                          limit: int = 0) -> list:
         return self.history.get_since(since_version, scope_path, limit=limit)
 
     def get_history_entry(self, version: int) -> dict | None:
@@ -264,13 +161,14 @@ class ServerRepo:
     async def async_record_history(self, version: int, who: str, message: str,
                                    scope_path: str, changes: list,
                                    conflicts: list = None, root_hash: str = ""):
-        await self.history.async_record(version, who, message, scope_path, changes,
-                                        conflicts, root_hash)
+        await self.history.async_record(version, who, message, scope_path,
+                                        changes, conflicts, root_hash)
 
     async def async_get_history_since(self, since_version: int,
                                       scope_path: str = None,
                                       limit: int = 0) -> list:
-        return await self.history.async_get_since(since_version, scope_path, limit=limit)
+        return await self.history.async_get_since(since_version, scope_path,
+                                                  limit=limit)
 
     async def async_get_history_entry(self, version: int) -> dict | None:
         return await self.history.async_get_entry(version)
@@ -280,13 +178,13 @@ class ServerRepo:
     def record_audit(self, event_type: str, agent_id: str, detail: dict):
         self.audit.record(event_type, agent_id, detail)
 
-    async def async_record_audit(self, event_type: str, agent_id: str, detail: dict):
+    async def async_record_audit(self, event_type: str, agent_id: str,
+                                 detail: dict):
         await self.audit.async_record(event_type, agent_id, detail)
 
     # ── Files in current/ ─────────────────────────
 
     def list_scope_files(self, scope: dict) -> dict[str, bytes]:
-        """Return {relative_path: file_bytes} for all files in scope."""
         scope_path = normalize_path(scope["path"])
         excludes = [normalize_path(e) for e in scope.get("exclude", [])]
         base = _scope_base(self.current, scope_path)
@@ -300,7 +198,6 @@ class ServerRepo:
 
     def _walk_scope_dir(self, dirpath: Path, prefix: str, scope_path: str,
                         excludes: list[str], out: dict[str, bytes]) -> None:
-        """Recursively collect files, skipping ignored and excluded paths."""
         for child in sorted(dirpath.iterdir()):
             rel, full_rel = _child_paths(child.name, prefix, scope_path)
             if _should_skip(child.name, full_rel, excludes):
@@ -311,7 +208,6 @@ class ServerRepo:
                 self._walk_scope_dir(child, rel, scope_path, excludes, out)
 
     async def async_list_scope_files(self, scope: dict) -> dict[str, bytes]:
-        """Async: return {relative_path: file_bytes} for all files in scope."""
         scope_path = normalize_path(scope["path"])
         excludes = [normalize_path(e) for e in scope.get("exclude", [])]
         base = _scope_base(self.current, scope_path)
@@ -334,7 +230,8 @@ class ServerRepo:
             if child.is_file():
                 out[rel] = await async_read_bytes(child)
             elif child.is_dir():
-                await self._async_walk_scope(child, rel, scope_path, excludes, out)
+                await self._async_walk_scope(child, rel, scope_path,
+                                             excludes, out)
 
     def write_scope_files(self, scope: dict, files: dict) -> None:
         scope_path = normalize_path(scope["path"])
@@ -373,7 +270,6 @@ class ServerRepo:
         base = _scope_base(self.current, scope_path)
         target = base / rel_path
         await async_unlink(target)
-        # Clean empty parents
         parent = target.parent
         while parent != base:
             children = await async_iterdir(parent)
@@ -385,7 +281,6 @@ class ServerRepo:
     # ── Tree operations ───────────────────────────
 
     def build_full_tree(self) -> str:
-        """Build a Merkle tree of the entire current/ directory."""
         ignore = IgnoreRules(self.current)
         if not self.current.exists() or not any(self.current.iterdir()):
             empty = json.dumps({}, sort_keys=True).encode()
@@ -396,7 +291,6 @@ class ServerRepo:
         return await asyncio.to_thread(self.build_full_tree)
 
     def build_scope_tree(self, scope: dict) -> str:
-        """Build a Merkle tree for the files in this scope and return root hash."""
         files = self.list_scope_files(scope)
         return self._build_tree_from_files(files)
 
@@ -433,31 +327,12 @@ class ServerRepo:
     def release_lock(self, scope_id: str):
         lock_release(self.locks_dir / f"{scope_id}.lock")
 
-    # ── Global lock for version/root atomicity (bug fix #2) ──
-
-    async def async_update_global_state(self, new_version: int, new_root: str,
-                                        who: str, message: str, scope_path: str,
-                                        changes: list, conflicts: list = None):
-        """Atomically update version + root hash under global lock.
-
-        This prevents race conditions when multiple scopes push concurrently.
-        """
-        async with self._global_lock:
-            await self.async_record_history(
-                new_version, who, message, scope_path, changes,
-                conflicts=conflicts, root_hash=new_root,
-            )
-            await self.async_set_latest_version(new_version)
-            await self.async_set_root_hash(new_root)
-
 
 def _scope_base(current: Path, scope_path: str) -> Path:
-    """Resolve the filesystem base directory for a scope path."""
     return current / scope_path if scope_path else current
 
 
 def _is_excluded(full_rel: str, excludes: list[str]) -> bool:
-    """Check if a path matches any exclusion pattern."""
     return any(
         full_rel.startswith(exc + "/") or full_rel == exc
         for exc in excludes
@@ -465,12 +340,10 @@ def _is_excluded(full_rel: str, excludes: list[str]) -> bool:
 
 
 def _child_paths(name: str, prefix: str, scope_path: str) -> tuple[str, str]:
-    """Compute relative and full-relative paths for a child entry."""
     rel = f"{prefix}/{name}" if prefix else name
     full_rel = f"{scope_path}/{rel}" if scope_path else rel
     return rel, full_rel
 
 
 def _should_skip(name: str, full_rel: str, excludes: list[str]) -> bool:
-    """Check if a child should be skipped (builtin ignore or excluded)."""
     return name in BUILTIN_IGNORE or _is_excluded(full_rel, excludes)

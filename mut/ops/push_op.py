@@ -9,7 +9,7 @@
 from __future__ import annotations
 
 from mut.ops.repo import MutRepo
-from mut.foundation.config import REMOTE_HEAD_FILE, TOKEN_FILE, load_config
+from mut.foundation.config import REMOTE_HEAD_FILE, CREDENTIAL_FILE, load_config
 from mut.foundation.fs import read_text, write_text
 from mut.foundation.transport import MutClient
 from mut.core import manifest as manifest_mod
@@ -26,8 +26,8 @@ def push(repo: MutRepo) -> dict:
     if not server_url:
         return _local_push(repo)
 
-    token = read_text(repo.mut_root / TOKEN_FILE)
-    client = MutClient(server_url, token)
+    credential = read_text(repo.mut_root / CREDENTIAL_FILE)
+    client = MutClient(server_url, credential)
 
     unpushed = repo.snapshots.get_unpushed()
     if not unpushed:
@@ -43,9 +43,9 @@ def push(repo: MutRepo) -> dict:
         return {"status": "up-to-date", "pushed": 0}
 
     remote_head_path = repo.mut_root / REMOTE_HEAD_FILE
-    base_version = int(read_text(remote_head_path)) if remote_head_path.exists() else 0
+    base_version = (int(read_text(remote_head_path))
+                    if remote_head_path.exists() else 0)
 
-    # Only collect hashes reachable from unpushed snapshots, not entire store
     relevant_hashes: set[str] = set()
     for s in unpushed:
         relevant_hashes.update(
@@ -76,11 +76,6 @@ def push(repo: MutRepo) -> dict:
     others_pushed = server_version > base_version + 1
 
     if merged or others_pushed:
-        # Our local working directory doesn't reflect the full server state.
-        # Either: (a) server merged our changes with others' (merged=True),
-        # or (b) other agents pushed between our base_version and now.
-        # Keep REMOTE_HEAD at base_version so the next pull fetches
-        # the complete server state including other agents' changes.
         write_text(remote_head_path, str(base_version))
     else:
         write_text(remote_head_path, str(server_version))
@@ -98,7 +93,6 @@ def push(repo: MutRepo) -> dict:
 
 
 def _local_push(repo: MutRepo) -> dict:
-    """Fallback for repos without a server (local-only mode)."""
     unpushed = repo.snapshots.get_unpushed()
     if not unpushed:
         return {"status": "up-to-date", "pushed": 0}

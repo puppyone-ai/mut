@@ -8,6 +8,8 @@ Metadata files:
 Migrates automatically from legacy single-file (snapshots.json) format.
 """
 
+from __future__ import annotations
+
 from datetime import datetime, timezone
 from pathlib import Path
 

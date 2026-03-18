@@ -1,9 +1,14 @@
-"""mut pull — Pull changes from the server since REMOTE_HEAD.
+"""mut pull — Sync local state with the server.
 
-1. Check for local dirty state (uncommitted changes)
-2. POST /pull with since_version + have_hashes
-3. Receive new files + objects (server skips objects we already have)
-4. Update working directory, objects, snapshots, manifest, HEAD, REMOTE_HEAD
+If unpushed commits exist, push them first (server-side merge), then pull
+the merged result. This keeps conflict resolution entirely on the server.
+
+Steps:
+1. Reject uncommitted changes (user must commit or --force)
+2. If unpushed commits exist → auto-push (server merges)
+3. POST /pull with since_version + have_hashes
+4. Overwrite working directory with server result
+5. Update objects, snapshots, manifest, HEAD, REMOTE_HEAD
 """
 
 from __future__ import annotations
@@ -12,7 +17,7 @@ import base64
 
 from mut.ops.repo import MutRepo
 from mut.foundation.config import (
-    REMOTE_HEAD_FILE, TOKEN_FILE, HEAD_FILE, load_config,
+    REMOTE_HEAD_FILE, CREDENTIAL_FILE, HEAD_FILE, load_config,
 )
 from mut.foundation.error import DirtyWorkdirError
 from mut.foundation.fs import read_text, write_text, mkdir_p
@@ -42,17 +47,23 @@ def pull(repo: MutRepo, force: bool = False) -> dict:
                 "Commit first, or use --force."
             )
 
-    token = read_text(repo.mut_root / TOKEN_FILE)
-    client = MutClient(server_url, token)
+    push_result = _auto_push_if_needed(repo)
+
+    credential = read_text(repo.mut_root / CREDENTIAL_FILE)
+    client = MutClient(server_url, credential)
 
     remote_head_path = repo.mut_root / REMOTE_HEAD_FILE
-    since_version = int(read_text(remote_head_path)) if remote_head_path.exists() else 0
+    since_version = (int(read_text(remote_head_path))
+                     if remote_head_path.exists() else 0)
 
     have_hashes = repo.store.all_hashes()
     resp = client.pull(since_version, have_hashes=have_hashes)
 
     if resp["status"] == "up-to-date":
-        return {"status": "up-to-date", "pulled": 0}
+        result: dict = {"status": "up-to-date", "pulled": 0}
+        if push_result:
+            result["push"] = push_result
+        return result
 
     files_b64 = resp.get("files", {})
     objects_b64 = resp.get("objects", {})
@@ -71,7 +82,8 @@ def pull(repo: MutRepo, force: bool = False) -> dict:
 
     root_hash = tree_mod.scan_dir(repo.store, repo.workdir, repo.ignore)
 
-    repo.snapshots.create(root_hash, "pull", f"pulled from server (v{server_version})",
+    repo.snapshots.create(root_hash, "pull",
+                          f"pulled from server (v{server_version})",
                           pushed=True)
 
     new_manifest = tree_mod.tree_to_flat(repo.store, root_hash)
@@ -81,15 +93,27 @@ def pull(repo: MutRepo, force: bool = False) -> dict:
     write_text(repo.mut_root / HEAD_FILE, str(latest_snap["id"]))
     write_text(remote_head_path, str(server_version))
 
-    return {
+    result = {
         "status": "updated",
         "pulled": len(files_b64),
         "server_version": server_version,
     }
+    if push_result:
+        result["push"] = push_result
+    return result
+
+
+def _auto_push_if_needed(repo: MutRepo) -> dict | None:
+    """Push unpushed commits before pulling. Returns push result or None."""
+    unpushed = repo.snapshots.get_unpushed()
+    if not unpushed:
+        return None
+
+    from mut.ops import push_op
+    return push_op.push(repo)
 
 
 def _remove_deleted_files(repo: MutRepo, server_paths: set[str]) -> None:
-    """Remove local files that no longer exist on the server."""
     old_manifest = manifest_mod.load(repo.mut_root)
     for old_path in old_manifest:
         if old_path not in server_paths:
@@ -100,7 +124,6 @@ def _remove_deleted_files(repo: MutRepo, server_paths: set[str]) -> None:
 
 
 def _clean_empty_parents(parent, stop_at) -> None:
-    """Remove empty parent directories up to stop_at."""
     while parent != stop_at and parent.exists() and not any(parent.iterdir()):
         parent.rmdir()
         parent = parent.parent

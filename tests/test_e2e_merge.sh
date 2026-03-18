@@ -62,11 +62,11 @@ cat > "$SERVER_DIR/current/src/config.json" << 'JSONEOF'
 }
 JSONEOF
 
-$MUT_SERVER add-scope "$SERVER_DIR" --id scope-src-a --scope-path "/src/" --agents agent-A
-$MUT_SERVER add-scope "$SERVER_DIR" --id scope-src-d --scope-path "/src/" --agents agent-D
+$MUT_SERVER add-scope "$SERVER_DIR" --id scope-src-a --scope-path "/src/"
+$MUT_SERVER add-scope "$SERVER_DIR" --id scope-src-d --scope-path "/src/"
 
-TOKEN_A=$($MUT_SERVER issue-token "$SERVER_DIR" --agent agent-A)
-TOKEN_D=$($MUT_SERVER issue-token "$SERVER_DIR" --agent agent-D)
+CRED_A=$($MUT_SERVER issue-credential "$SERVER_DIR" --scope scope-src-a --agent agent-A --mode rw)
+CRED_D=$($MUT_SERVER issue-credential "$SERVER_DIR" --scope scope-src-d --agent agent-D --mode rw)
 
 $MUT_SERVER serve "$SERVER_DIR" --port $PORT &
 SERVER_PID=$!
@@ -81,12 +81,12 @@ echo "━━━ Both agents clone /src/ ━━━"
 
 mkdir -p "$AGENT_A_DIR"
 cd "$AGENT_A_DIR"
-$MUT clone "$SERVER_URL" --token "$TOKEN_A"
+$MUT clone "$SERVER_URL" --credential "$CRED_A"
 echo "  ✓ Agent-A cloned"
 
 mkdir -p "$AGENT_D_DIR"
 cd "$AGENT_D_DIR"
-$MUT clone "$SERVER_URL" --token "$TOKEN_D"
+$MUT clone "$SERVER_URL" --credential "$CRED_D"
 echo "  ✓ Agent-D cloned"
 
 echo ""
