@@ -64,11 +64,13 @@ class CloneResponse:
     history: list[dict]
     version: int
     scope: ScopeInfo
+    agent_id: str = ""
     protocol_version: int = PROTOCOL_VERSION
 
     def to_dict(self) -> dict:
-        return {
+        d = {
             "protocol_version": self.protocol_version,
+            "agent_id": self.agent_id,
             "project": self.project,
             "files": self.files,
             "objects": self.objects,
@@ -76,6 +78,7 @@ class CloneResponse:
             "version": self.version,
             "scope": self.scope.to_dict(),
         }
+        return d
 
 
 # ── Push ───────────────────────────────────────
@@ -205,26 +208,6 @@ class NegotiateResponse:
         return {
             "protocol_version": self.protocol_version,
             "missing": self.missing,
-        }
-
-
-# ── Register (invite) ─────────────────────────
-
-@dataclass
-class RegisterResponse:
-    agent_id: str
-    token: str
-    project: str = ""
-    scope: ScopeInfo = field(default_factory=ScopeInfo)
-    protocol_version: int = PROTOCOL_VERSION
-
-    def to_dict(self) -> dict:
-        return {
-            "protocol_version": self.protocol_version,
-            "agent_id": self.agent_id,
-            "token": self.token,
-            "project": self.project,
-            "scope": self.scope.to_dict(),
         }
 
 

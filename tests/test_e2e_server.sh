@@ -56,23 +56,23 @@ echo "  ✓ Server repo initialized with seed files"
 echo ""
 echo "━━━ Step 2: Add scopes ━━━"
 
-$MUT_SERVER add-scope "$SERVER_DIR" --id scope-src --scope-path "/src/" --agents agent-A
-$MUT_SERVER add-scope "$SERVER_DIR" --id scope-docs --scope-path "/docs/" --agents agent-B
+$MUT_SERVER add-scope "$SERVER_DIR" --id scope-src --scope-path "/src/"
+$MUT_SERVER add-scope "$SERVER_DIR" --id scope-docs --scope-path "/docs/"
 
 echo "  ✓ Agent-A → /src/ (rw)"
 echo "  ✓ Agent-B → /docs/ (rw)"
 
 # ══════════════════════════════════════════════════
-# STEP 3: Issue tokens
+# STEP 3: Issue credentials
 # ══════════════════════════════════════════════════
 echo ""
-echo "━━━ Step 3: Issue tokens ━━━"
+echo "━━━ Step 3: Issue credentials ━━━"
 
-TOKEN_A=$($MUT_SERVER issue-token "$SERVER_DIR" --agent agent-A)
-TOKEN_B=$($MUT_SERVER issue-token "$SERVER_DIR" --agent agent-B)
+CRED_A=$($MUT_SERVER issue-credential "$SERVER_DIR" --scope scope-src --agent agent-A --mode rw)
+CRED_B=$($MUT_SERVER issue-credential "$SERVER_DIR" --scope scope-docs --agent agent-B --mode rw)
 
-echo "  ✓ Token-A: ${TOKEN_A:0:30}..."
-echo "  ✓ Token-B: ${TOKEN_B:0:30}..."
+echo "  ✓ Cred-A: ${CRED_A:0:30}..."
+echo "  ✓ Cred-B: ${CRED_B:0:30}..."
 
 # ══════════════════════════════════════════════════
 # STEP 4: Start server in background
@@ -99,7 +99,7 @@ echo "━━━ Step 5: Agent-A clones /src/ ━━━"
 
 mkdir -p "$AGENT_A_DIR"
 cd "$AGENT_A_DIR"
-$MUT clone "$SERVER_URL" --token "$TOKEN_A"
+$MUT clone "$SERVER_URL" --credential "$CRED_A"
 
 echo "  ✓ Cloned. Files in workspace:"
 ls -la "$AGENT_A_DIR"
@@ -114,7 +114,7 @@ echo "━━━ Step 6: Agent-B clones /docs/ ━━━"
 
 mkdir -p "$AGENT_B_DIR"
 cd "$AGENT_B_DIR"
-$MUT clone "$SERVER_URL" --token "$TOKEN_B"
+$MUT clone "$SERVER_URL" --credential "$CRED_B"
 
 echo "  ✓ Cloned. Files in workspace:"
 ls -la "$AGENT_B_DIR"

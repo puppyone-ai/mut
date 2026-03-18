@@ -9,7 +9,6 @@ from mut.core.protocol import (
     PushRequest, PushResponse,
     PullRequest, PullResponse,
     NegotiateRequest, NegotiateResponse,
-    RegisterResponse,
     ErrorResponse,
 )
 
@@ -149,22 +148,6 @@ class TestNegotiate:
         d = resp.to_dict()
         assert d["missing"] == ["bbb"]
         assert d["protocol_version"] == PROTOCOL_VERSION
-
-
-# ── RegisterResponse ───────────────────────────
-
-class TestRegisterResponse:
-    def test_to_dict(self):
-        resp = RegisterResponse(
-            agent_id="agent-abc",
-            token="eyJ...",
-            project="my-project",
-            scope=ScopeInfo(path="/src/", mode="rw"),
-        )
-        d = resp.to_dict()
-        assert d["agent_id"] == "agent-abc"
-        assert d["token"] == "eyJ..."
-        assert d["scope"]["path"] == "/src/"
 
 
 # ── ErrorResponse ──────────────────────────────

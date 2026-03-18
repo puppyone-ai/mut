@@ -11,7 +11,7 @@ set -e
 #
 #  Flow:
 #    1. Init server, copy seed files into current/
-#    2. Add scope, issue token, start server
+#    2. Add scope, issue credential, start server
 #    3. Client clone
 #    4. Client modify → commit → push → verify server
 #    5. Server gets new file → client pull → verify client
@@ -57,12 +57,12 @@ echo "  ✓ Server initialized"
 echo "  Files in server/repo/current/:"
 find "$SERVER_REPO/current" -type f | sort | sed 's/^/    /'
 
-# ── Step 2: Add scope + issue token + start ───────
+# ── Step 2: Add scope + issue credential + start ──
 echo ""
-echo "━━━ Step 2: Add scope, issue token, start server ━━━"
+echo "━━━ Step 2: Add scope, issue credential, start server ━━━"
 
-$MUT_SERVER add-scope "$SERVER_REPO" --id scope-src --scope-path "/src/" --agents agent-1
-TOKEN=$($MUT_SERVER issue-token "$SERVER_REPO" --agent agent-1)
+$MUT_SERVER add-scope "$SERVER_REPO" --id scope-src --scope-path "/src/"
+CRED=$($MUT_SERVER issue-credential "$SERVER_REPO" --scope scope-src --agent agent-1 --mode rw)
 
 $MUT_SERVER serve "$SERVER_REPO" --port $PORT &
 SERVER_PID=$!
@@ -80,7 +80,7 @@ echo "━━━ Step 3: Client clone ━━━"
 
 mkdir -p "$CLIENT_WS"
 cd "$CLIENT_WS"
-$MUT clone "$SERVER_URL" --token "$TOKEN"
+$MUT clone "$SERVER_URL" --credential "$CRED"
 
 echo "  ✓ Cloned. Client files:"
 ls "$CLIENT_WS" | sed 's/^/    /'

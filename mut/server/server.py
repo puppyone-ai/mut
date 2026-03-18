@@ -1,24 +1,17 @@
 """Fully async Mut HTTP API server built on asyncio.
 
-Routes requests to async handler functions. Errors raised as MutError
-subclasses are automatically mapped to the correct HTTP status code
-via error.http_status.
+Auth-agnostic: the server accepts a pluggable Authenticator that
+resolves credentials into an auth context (agent + scope + mode).
+MUT core never touches credentials directly.
 
 Endpoints:
   POST /clone      — Agent requests scope files + history
   POST /push       — Agent pushes local commits (with auto-merge)
   POST /pull       — Agent pulls changes since a version
   POST /negotiate  — Hash negotiation for object dedup
-  POST /invite/<id> — Register via invite
   GET  /health     — Health check
 
-All requests carry Authorization: Bearer <token>.
 Push never fails — conflicts are resolved server-side via three-way merge + LWW.
-
-Bug fixes applied:
-  #1: lost_content + lost_hash persisted in history and audit
-  #2: Global lock protects version/root_hash atomicity across scopes
-  #3: lost_hash stores full object hash for recovery
 """
 
 from __future__ import annotations
@@ -28,23 +21,23 @@ import base64
 import json
 
 from mut.foundation.config import normalize_path, HASH_LEN
-from mut.core.auth import verify_token
 from mut.core.protocol import PROTOCOL_VERSION
 from mut.core.merge import merge_file_sets
 from mut.core.scope import check_path_permission
 from mut.core import tree as tree_mod
 from mut.foundation.error import (
-    MutError, AuthenticationError, PermissionDenied, LockError,
+    MutError, PermissionDenied, LockError,
     ObjectNotFoundError, PayloadTooLargeError,
 )
+from mut.server.auth.base import Authenticator
 from mut.server.repo import ServerRepo
 from mut.server.graft import async_graft_subtree
 
 
 MAX_BODY_SIZE = 256 * 1024 * 1024  # 256 MB
-MAX_CLONE_HISTORY = 200  # Cap history entries returned on clone
+MAX_CLONE_HISTORY = 200
 
-# Status text lookup
+
 _STATUS_TEXT = {
     200: "OK", 400: "Bad Request", 401: "Unauthorized", 403: "Forbidden",
     404: "Not Found", 409: "Conflict", 413: "Payload Too Large",
@@ -55,7 +48,6 @@ _STATUS_TEXT = {
 # ── Async HTTP primitives ─────────────────────
 
 async def _read_request(reader: asyncio.StreamReader) -> tuple[str, str, dict]:
-    """Parse HTTP request line + headers. Returns (method, path, headers)."""
     request_line = await reader.readline()
     if not request_line:
         raise ConnectionError("empty request")
@@ -77,7 +69,6 @@ async def _read_request(reader: asyncio.StreamReader) -> tuple[str, str, dict]:
 
 
 async def _read_body(reader: asyncio.StreamReader, headers: dict) -> dict:
-    """Read and parse JSON body."""
     length = int(headers.get("content-length", 0))
     if length == 0:
         return {}
@@ -88,7 +79,6 @@ async def _read_body(reader: asyncio.StreamReader, headers: dict) -> dict:
 
 
 def _build_response(data: dict, status: int = 200) -> bytes:
-    """Build a complete HTTP response."""
     body = json.dumps(data, ensure_ascii=False).encode()
     status_text = _STATUS_TEXT.get(status, "Unknown")
     header = (
@@ -110,22 +100,6 @@ async def _send_error(writer: asyncio.StreamWriter, status: int, message: str):
     await _send(writer, {"error": message}, status)
 
 
-# ── Auth ──────────────────────────────────────
-
-async def _auth(repo: ServerRepo, headers: dict) -> dict:
-    """Verify token, return payload with _scope attached."""
-    auth_header = headers.get("authorization", "")
-    if not auth_header.startswith("Bearer "):
-        raise AuthenticationError("missing or invalid Authorization header")
-    token = auth_header[7:]
-    payload = verify_token(token, repo.get_secret())
-    scope = await repo.async_get_scope_for_agent(payload["agent"])
-    if scope is None:
-        raise PermissionDenied(f"no scope for agent '{payload['agent']}'")
-    payload["_scope"] = scope
-    return payload
-
-
 # ── Handlers ──────────────────────────────────
 
 async def _handle_clone(repo: ServerRepo, auth: dict, _body: dict) -> dict:
@@ -142,7 +116,7 @@ async def _handle_clone(repo: ServerRepo, auth: dict, _body: dict) -> dict:
 
     latest = await repo.async_get_latest_version()
     history = await repo.async_get_history_since(0, scope_path=scope["path"],
-                                                     limit=MAX_CLONE_HISTORY)
+                                                 limit=MAX_CLONE_HISTORY)
 
     await repo.async_record_audit("clone", auth["agent"], {
         "scope": scope["path"],
@@ -151,6 +125,7 @@ async def _handle_clone(repo: ServerRepo, auth: dict, _body: dict) -> dict:
     })
 
     return {
+        "agent_id": auth["agent"],
         "project": repo.get_project_name(),
         "files": files_b64,
         "objects": objects_b64,
@@ -173,8 +148,6 @@ async def _handle_push(repo: ServerRepo, auth: dict, body: dict) -> dict:
     scope_id = scope["id"]
     scope_lock = repo._get_scope_lock(scope_id)
 
-    # Safe in asyncio: no await between locked() check and async with,
-    # so no other coroutine can interleave — effectively atomic.
     if scope_lock.locked():
         raise LockError("scope is locked by another push, retry later")
 
@@ -182,13 +155,12 @@ async def _handle_push(repo: ServerRepo, auth: dict, body: dict) -> dict:
         return await _push_locked(repo, scope, auth, body)
 
 
-async def _push_locked(repo: ServerRepo, scope: dict, auth: dict, body: dict) -> dict:
-    """Core push logic, runs under scope lock."""
+async def _push_locked(repo: ServerRepo, scope: dict, auth: dict,
+                       body: dict) -> dict:
     objects_b64 = body.get("objects", {})
     snapshots = body.get("snapshots", [])
     base_version = body.get("base_version", 0)
 
-    # Store incoming objects
     for _h, b64data in objects_b64.items():
         await repo.store.async_put(base64.b64decode(b64data))
 
@@ -231,9 +203,7 @@ async def _push_locked(repo: ServerRepo, scope: dict, auth: dict, body: dict) ->
 
     new_scope_tree_hash = await repo.async_build_scope_tree(scope)
 
-    # Bug fix #2: global lock protects the entire read-version + graft + write
-    # sequence, preventing race conditions when multiple scopes push concurrently.
-    async with repo._global_lock:
+    async with repo._ensure_global_lock():
         current_version = await repo.async_get_latest_version()
         old_root = await repo.async_get_root_hash()
 
@@ -277,7 +247,6 @@ async def _push_locked(repo: ServerRepo, scope: dict, auth: dict, body: dict) ->
 
 
 def _is_valid_hash(h: str) -> bool:
-    """Reject obviously invalid hash strings (too long, non-alphanumeric)."""
     return isinstance(h, str) and 0 < len(h) <= HASH_LEN and h.isalnum()
 
 
@@ -315,7 +284,8 @@ async def _handle_pull(repo: ServerRepo, auth: dict, body: dict) -> dict:
     objects_b64 = {h: base64.b64encode(repo.store.get(h)).decode()
                    for h in scope_hashes if h not in have_hashes}
 
-    history = await repo.async_get_history_since(since_version, scope_path=scope["path"])
+    history = await repo.async_get_history_since(since_version,
+                                                 scope_path=scope["path"])
 
     await repo.async_record_audit("pull", auth["agent"], {
         "scope": scope["path"],
@@ -329,23 +299,6 @@ async def _handle_pull(repo: ServerRepo, auth: dict, body: dict) -> dict:
         "files": files_b64,
         "objects": objects_b64,
         "history": history,
-    }
-
-
-async def _handle_register(repo: ServerRepo, path: str) -> dict:
-    invite_id = path.split("/invite/", 1)[1].strip("/")
-    if not invite_id:
-        raise ValueError("missing invite ID")
-    agent_id, token = await repo.async_use_invite(invite_id)
-    scope = await repo.async_get_scope_for_agent(agent_id)
-    return {
-        "agent_id": agent_id,
-        "token": token,
-        "project": repo.get_project_name(),
-        "scope": {
-            "path": scope["path"],
-            "mode": scope.get("mode", "rw"),
-        },
     }
 
 
@@ -364,7 +317,6 @@ _POST_ROUTES = {
 
 
 def _check_protocol_version(body: dict):
-    """Reject requests with incompatible protocol versions."""
     client_version = body.get("protocol_version", 1)
     if client_version > PROTOCOL_VERSION:
         raise ValueError(
@@ -373,14 +325,11 @@ def _check_protocol_version(body: dict):
         )
 
 
-async def _dispatch(repo: ServerRepo, method: str, path: str,
+async def _dispatch(repo: ServerRepo, authenticator: Authenticator,
+                    method: str, path: str,
                     headers: dict, body: dict) -> tuple[dict, int]:
-    """Route a request to the appropriate handler. Returns (response_dict, status_code)."""
     if method == "GET" and path == "/health":
         return _handle_health(), 200
-
-    if method == "POST" and path.startswith("/invite/"):
-        return await _handle_register(repo, path), 200
 
     if method != "POST":
         return {"error": f"unknown endpoint: {path}"}, 404
@@ -390,27 +339,27 @@ async def _dispatch(repo: ServerRepo, method: str, path: str,
         return {"error": f"unknown endpoint: {path}"}, 404
 
     _check_protocol_version(body)
-    auth = await _auth(repo, headers)
+    auth = await authenticator.authenticate(headers, body)
     return await handler(repo, auth, body), 200
 
 
 # ── Connection handler ────────────────────────
 
-async def _handle_connection(repo: ServerRepo,
+async def _handle_connection(repo: ServerRepo, authenticator: Authenticator,
                              reader: asyncio.StreamReader,
                              writer: asyncio.StreamWriter):
-    """Handle a single HTTP connection."""
     try:
         method, path, headers = await _read_request(reader)
         body = await _read_body(reader, headers)
-        result, status = await _dispatch(repo, method, path, headers, body)
+        result, status = await _dispatch(repo, authenticator,
+                                         method, path, headers, body)
         await _send(writer, result, status)
     except MutError as e:
         await _send_error(writer, e.http_status, str(e))
     except (ValueError, KeyError) as e:
         await _send_error(writer, 400, str(e))
     except ConnectionError:
-        pass  # client disconnected
+        pass
     except Exception as e:
         await _send_error(writer, 500, f"internal error: {e}")
     finally:
@@ -490,25 +439,34 @@ def _get_base_files(repo, scope, base_version) -> dict:
             subtree_hash = _navigate_tree(repo.store, entry["root"], parts)
             if subtree_hash:
                 flat_hashes = tree_mod.tree_to_flat(repo.store, subtree_hash)
-                return {path: repo.store.get(h) for path, h in flat_hashes.items()}
+                return {path: repo.store.get(h)
+                        for path, h in flat_hashes.items()}
         except (KeyError, json.JSONDecodeError) as exc:
-            print(f"[mut-server] warning: failed to read base v{base_version}: {exc}")
+            print(f"[mut-server] warning: failed to read base "
+                  f"v{base_version}: {exc}")
         except ObjectNotFoundError as exc:
-            print(f"[mut-server] warning: missing object for base v{base_version}: {exc}")
+            print(f"[mut-server] warning: missing object for base "
+                  f"v{base_version}: {exc}")
     return {}
 
 
 # ── Server entry point ────────────────────────
 
-_GRACEFUL_TIMEOUT = 10  # seconds to wait for in-flight requests
+_GRACEFUL_TIMEOUT = 10
 
 
-async def async_serve(repo_root: str, host: str = "127.0.0.1", port: int = 9742):
-    """Start the async Mut HTTP server with graceful shutdown."""
+async def async_serve(repo_root: str, host: str = "127.0.0.1",
+                      port: int = 9742,
+                      authenticator: Authenticator | None = None):
+    """Start the async Mut HTTP server with pluggable auth."""
+    from mut.server.auth import NoAuth
+
     repo = ServerRepo(repo_root)
     repo.check_init()
 
-    # Build initial root tree and record version 0 if first start
+    if authenticator is None:
+        authenticator = NoAuth(repo.scopes)
+
     if not repo.get_root_hash():
         root = repo.build_full_tree()
         repo.set_root_hash(root)
@@ -523,13 +481,15 @@ async def async_serve(repo_root: str, host: str = "127.0.0.1", port: int = 9742)
         task = asyncio.current_task()
         active_tasks.add(task)
         try:
-            await _handle_connection(repo, reader, writer)
+            await _handle_connection(repo, authenticator, reader, writer)
         finally:
             active_tasks.discard(task)
 
     server = await asyncio.start_server(on_connection, host, port)
-    print(f"Mut async server listening on http://{host}:{port}")
+    auth_name = type(authenticator).__name__
+    print(f"Mut server listening on http://{host}:{port}")
     print(f"  repo: {repo.root}")
+    print(f"  auth: {auth_name}")
     print(f"  version: {repo.get_latest_version()}")
     print(f"  root: {repo.get_root_hash()[:16]}")
 
@@ -537,7 +497,6 @@ async def async_serve(repo_root: str, host: str = "127.0.0.1", port: int = 9742)
         async with server:
             await server.serve_forever()
     except asyncio.CancelledError:
-        # Graceful shutdown: clean up then re-raise per asyncio contract
         server.close()
         await server.wait_closed()
         if active_tasks:
@@ -546,15 +505,16 @@ async def async_serve(repo_root: str, host: str = "127.0.0.1", port: int = 9742)
         print("Server stopped.")
         raise
     finally:
-        # Ensure cleanup runs for non-cancellation exits too
+        await authenticator.close()
         if server.is_serving():
             server.close()
             await server.wait_closed()
 
 
-def serve(repo_root: str, host: str = "127.0.0.1", port: int = 9742):
+def serve(repo_root: str, host: str = "127.0.0.1", port: int = 9742,
+          authenticator: Authenticator | None = None):
     """Start the Mut HTTP server (blocking entry point for CLI)."""
     try:
-        asyncio.run(async_serve(repo_root, host, port))
+        asyncio.run(async_serve(repo_root, host, port, authenticator))
     except KeyboardInterrupt:
         print("\nShutting down.")

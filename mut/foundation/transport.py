@@ -3,8 +3,9 @@
 Uses only stdlib (urllib for sync, asyncio for async) — no external dependencies.
 All payloads are JSON. Binary objects are base64-encoded inside JSON.
 
-MutClient encapsulates authenticated requests so that individual ops
-don't duplicate auth/transport boilerplate.
+MutClient encapsulates server URL + credential so that individual ops
+don't duplicate transport boilerplate. The credential is an opaque string
+— could be an API key, token, or anything the server's auth layer accepts.
 """
 
 from __future__ import annotations
@@ -24,16 +25,13 @@ from mut.core.protocol import (
 )
 
 
-# ── Sync transport ────────────────────────────
-
-_DEFAULT_TIMEOUT = 60  # seconds
+_DEFAULT_TIMEOUT = 60
 _MAX_RETRIES = 3
-_RETRY_BACKOFF = 1.0  # base seconds; doubles each retry
+_RETRY_BACKOFF = 1.0
 _RETRYABLE_CODES = {429, 502, 503, 504}
 
 
 def _parse_http_error(e: urllib.error.HTTPError) -> str:
-    """Extract error message from an HTTPError response body."""
     try:
         detail = json.loads(e.read().decode())
         return detail.get("error", str(e))
@@ -42,7 +40,6 @@ def _parse_http_error(e: urllib.error.HTTPError) -> str:
 
 
 def _retry_delay(e: urllib.error.HTTPError | None, attempt: int) -> float:
-    """Compute delay before next retry, respecting Retry-After header."""
     if isinstance(e, urllib.error.HTTPError):
         retry_after = e.headers.get("Retry-After")
         if retry_after:
@@ -52,7 +49,6 @@ def _retry_delay(e: urllib.error.HTTPError | None, attempt: int) -> float:
 
 def _do_request(url: str, body: bytes | None, headers: dict,
                 method: str, timeout: int) -> dict:
-    """Execute a single HTTP request. Raises urllib errors on failure."""
     req = urllib.request.Request(url, data=body, headers=headers, method=method)
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         return json.loads(resp.read().decode())
@@ -65,12 +61,12 @@ def _is_retryable(e: Exception) -> bool:
 
 
 def _make_request(url: str, data: dict | None = None,
-                  token: str | None = None, method: str | None = None,
+                  credential: str | None = None, method: str | None = None,
                   timeout: int = _DEFAULT_TIMEOUT) -> dict:
     """Send an HTTP request with retry on transient failures."""
     headers: dict[str, str] = {"Content-Type": "application/json"}
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
+    if credential:
+        headers["Authorization"] = f"Bearer {credential}"
 
     body = json.dumps(data).encode() if data is not None else None
     if method is None:
@@ -99,28 +95,27 @@ def _raise_as_network_error(e: Exception):
 
 
 class MutClient:
-    """Authenticated HTTP client for a single Mut server.
+    """HTTP client for a single Mut server.
 
-    Encapsulates server URL + token so that ops don't repeat
-    the same auth/request boilerplate.
+    Credential is an opaque string — the server's auth layer
+    decides how to interpret it (API key, token, scope ID, etc.).
     """
 
-    def __init__(self, server_url: str, token: str):
+    def __init__(self, server_url: str, credential: str):
         self.server_url = server_url.rstrip("/")
-        self.token = token
+        self.credential = credential
 
     def _post(self, endpoint: str, data: dict) -> dict:
         return _make_request(
-            f"{self.server_url}{endpoint}", data=data, token=self.token,
+            f"{self.server_url}{endpoint}", data=data,
+            credential=self.credential,
         )
 
     def clone(self) -> dict:
-        """POST /clone — request scope files and history."""
         return self._post("/clone", CloneRequest().to_dict())
 
     def push(self, base_version: int, snapshots: list,
              objects: dict[str, bytes]) -> dict:
-        """POST /push — send unpushed snapshots and new objects."""
         req = PushRequest(
             base_version=base_version,
             snapshots=snapshots,
@@ -130,13 +125,11 @@ class MutClient:
         return self._post("/push", req.to_dict())
 
     def negotiate(self, hashes: list[str]) -> dict:
-        """POST /negotiate — ask server which objects it needs."""
         req = NegotiateRequest(hashes=hashes)
         return self._post("/negotiate", req.to_dict())
 
     def pull(self, since_version: int,
              have_hashes: Optional[list[str]] = None) -> dict:
-        """POST /pull — request changes since a version."""
         req = PullRequest(
             since_version=since_version,
             have_hashes=have_hashes or [],
@@ -144,42 +137,17 @@ class MutClient:
         return self._post("/pull", req.to_dict())
 
 
-# ── Legacy function-based API (thin wrappers for backward compat) ──
-
-def post_clone(server_url: str, token: str) -> dict:
-    return MutClient(server_url, token).clone()
-
-
-def post_push(server_url: str, token: str, base_version: int,
-              snapshots: list, objects: dict) -> dict:
-    return MutClient(server_url, token).push(base_version, snapshots, objects)
-
-
-def post_negotiate(server_url: str, token: str, hashes: list) -> dict:
-    return MutClient(server_url, token).negotiate(hashes)
-
-
-def post_pull(server_url: str, token: str, since_version: int,
-              have_hashes: list = None) -> dict:
-    return MutClient(server_url, token).pull(since_version, have_hashes)
-
-
-# ── Async transport ───────────────────────────
-
 class AsyncMutClient:
-    """Async HTTP client for a single Mut server.
+    """Async HTTP client for a single Mut server."""
 
-    Uses asyncio.to_thread(urllib) for simplicity and reliability — zero external deps.
-    """
-
-    def __init__(self, server_url: str, token: str):
+    def __init__(self, server_url: str, credential: str):
         self.server_url = server_url.rstrip("/")
-        self.token = token
+        self.credential = credential
 
     async def _post(self, endpoint: str, data: dict) -> dict:
         url = f"{self.server_url}{endpoint}"
         return await asyncio.to_thread(
-            _make_request, url, data, self.token,
+            _make_request, url, data, self.credential,
         )
 
     async def clone(self) -> dict:

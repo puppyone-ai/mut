@@ -80,12 +80,12 @@ with open('$SERVER_DIR/current/project/paper.pdf', 'wb') as f:
 
 # Create 5 agents sharing /project/
 for i in $(seq 1 5); do
-    $MUT_SERVER add-scope "$SERVER_DIR" --id "scope-$i" --scope-path "/project/" --agents "agent-$i" --mode rw 2>/dev/null
+    $MUT_SERVER add-scope "$SERVER_DIR" --id "scope-$i" --scope-path "/project/" 2>/dev/null
 done
 
-declare -a TOKENS
+declare -a CREDS
 for i in $(seq 1 5); do
-    TOKENS[$i]=$($MUT_SERVER issue-token "$SERVER_DIR" --agent "agent-$i")
+    CREDS[$i]=$($MUT_SERVER issue-credential "$SERVER_DIR" --scope "scope-$i" --agent "agent-$i" --mode rw)
 done
 
 $MUT_SERVER serve "$SERVER_DIR" --port $PORT &
@@ -99,7 +99,7 @@ echo "--- Cloning 5 agents ---"
 for i in $(seq 1 5); do
     WDIR="$TESTDIR/w$i"
     mkdir -p "$WDIR" && cd "$WDIR"
-    $MUT clone "$SERVER_URL" --token "${TOKENS[$i]}" 2>/dev/null
+    $MUT clone "$SERVER_URL" --credential "${CREDS[$i]}" 2>/dev/null
     echo "  Agent-$i cloned"
 done
 
@@ -611,35 +611,11 @@ $MUT push 2>/dev/null
 check "Identical content push works" "[ -f '$SERVER_DIR/current/project/dedup2.txt' ]"
 
 # ══════════════════════════════════════════════════════════════
-# TEST GROUP 12: Invite-based registration
+# TEST GROUP 12: Checkout (restore old version)
 # ══════════════════════════════════════════════════════════════
 echo ""
 echo "══════════════════════════════════════════════════"
-echo "  GROUP 12: Invite registration"
-echo "══════════════════════════════════════════════════"
-
-# Create invite with max_uses
-INVITE_OUT=$($MUT_SERVER create-invite "$SERVER_DIR" --scope-path "/project/" --mode rw 2>&1)
-INVITE_URL=$(echo "$INVITE_OUT" | grep -oP 'http://[^ ]+' | head -1)
-
-if [ -n "$INVITE_URL" ]; then
-    # Fix localhost to actual server URL
-    INVITE_URL=$(echo "$INVITE_URL" | sed "s|localhost|127.0.0.1|")
-    INVITE_URL=$(echo "$INVITE_URL" | sed "s|:9742|:$PORT|")
-
-    REGISTER_OUT=$($MUT register "$INVITE_URL" 2>&1 || true)
-    check "Invite register works" "echo '$REGISTER_OUT' | grep -qi 'registered\|agent'"
-else
-    echo "  SKIP: no invite URL found"
-    PASS=$((PASS + 1))
-fi
-
-# ══════════════════════════════════════════════════════════════
-# TEST GROUP 13: Checkout (restore old version)
-# ══════════════════════════════════════════════════════════════
-echo ""
-echo "══════════════════════════════════════════════════"
-echo "  GROUP 13: Checkout old version"
+echo "  GROUP 12: Checkout old version"
 echo "══════════════════════════════════════════════════"
 
 cd "$(W 1)" && $MUT pull 2>/dev/null
@@ -685,6 +661,5 @@ echo "    line-level merge, json key-merge, LWW"
 echo "    mixed concurrent edits, add/delete files"
 echo "    dirty workdir detection, force pull"
 echo "    object dedup via negotiate"
-echo "    invite registration"
 echo "    local: log, status, checkout"
 echo "============================================================"

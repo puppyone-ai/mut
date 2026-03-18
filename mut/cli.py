@@ -3,7 +3,7 @@
 Mut — Managed Unified Tree.
 
 A minimal, Git-like version management protocol designed for AI agents.
-Unlike Git: centralized truth, auto-resolve conflicts, per-path access.
+Unlike Git: centralized truth, auto-resolve conflicts, per-scope access.
 
 Usage:
     mut init                          Initialize a .mut/ repo
@@ -37,19 +37,7 @@ from mut.ops import (
     push_op,
     pull_op,
     stats_op,
-    register_op,
 )
-
-
-def cmd_register(args):
-    result = register_op.register(args.invite_url)
-    print(f"Registered with {result['server']}")
-    print(f"  agent:   {result['agent_id']}")
-    print(f"  project: {result['project']}")
-    print(f"  scope:   {result['scope'].get('path', '/')}")
-    print("")
-    print("Credentials saved. You can now clone:")
-    print(f"  mut clone {result['server']}")
 
 
 def cmd_init(args):
@@ -59,29 +47,24 @@ def cmd_init(args):
 
 def cmd_clone(args):
     url = args.url
-    token = args.token
+    credential = args.credential
 
-    if "/invite/" in url:
-        result = register_op.register(url)
-        print(f"Registered with {result['server']}")
-        print(f"  agent: {result['agent_id']}")
-        url = result["server"]
-        from mut.foundation.credentials import get_credential
-        cred = get_credential(url)
-        token = cred["token"]
-
-    if not token:
+    if not credential:
         from mut.foundation.credentials import get_credential
         cred = get_credential(url)
         if cred:
-            token = cred["token"]
+            credential = cred["credential"]
         else:
-            print("fatal: no --token provided and no stored credentials for this server.", file=sys.stderr)
-            print("  Run 'mut clone <invite-url>' to register, or pass --token.", file=sys.stderr)
+            print(
+                "fatal: no --credential provided and no stored credentials "
+                "for this server.",
+                file=sys.stderr,
+            )
+            print("  Pass --credential <key> to authenticate.", file=sys.stderr)
             sys.exit(1)
 
     workdir = args.dir if args.dir else None
-    repo = clone_op.clone(url, token, workdir)
+    repo = clone_op.clone(url, credential, workdir)
     print(f"Cloned into {repo.workdir}")
 
 
@@ -93,7 +76,8 @@ def cmd_commit(args):
         print("nothing to commit, working directory unchanged")
     else:
         pushed_tag = "" if snap["pushed"] else " (local)"
-        print(f"[{snap['who']}] snapshot #{snap['id']}{pushed_tag}: {snap['message']}")
+        print(f"[{snap['who']}] snapshot #{snap['id']}{pushed_tag}: "
+              f"{snap['message']}")
         print(f"  root: {snap['root']}")
 
 
@@ -106,7 +90,8 @@ def cmd_log(args):
     for s in entries:
         parent = f" ← #{s['parent']}" if s['parent'] else ""
         pushed = "✓" if s.get("pushed", True) else "○"
-        print(f"  {pushed} #{s['id']}  {s['time']}  [{s['who']}]  {s['message']}{parent}")
+        print(f"  {pushed} #{s['id']}  {s['time']}  [{s['who']}]  "
+              f"{s['message']}{parent}")
         print(f"        root: {s['root']}")
 
 
@@ -144,14 +129,16 @@ def cmd_checkout(args):
 
 def cmd_show(args):
     if ":" not in args.ref:
-        print("usage: mut show <id>:<path>  e.g. mut show 1:src/main.py", file=sys.stderr)
+        print("usage: mut show <id>:<path>  e.g. mut show 1:src/main.py",
+              file=sys.stderr)
         sys.exit(1)
     repo = MutRepo(".")
     sid, path = args.ref.split(":", 1)
     try:
         snap_id = int(sid)
     except ValueError:
-        print(f"fatal: invalid snapshot id '{sid}' — must be an integer", file=sys.stderr)
+        print(f"fatal: invalid snapshot id '{sid}' — must be an integer",
+              file=sys.stderr)
         sys.exit(1)
     print(show_op.show(repo, snap_id, path))
 
@@ -175,7 +162,8 @@ def cmd_push(args):
         if result.get("server_version"):
             print(f"  server version: {result['server_version']}")
         if result.get("merged"):
-            print(f"  auto-merged ({result.get('conflicts', 0)} conflict(s) resolved)")
+            print(f"  auto-merged ({result.get('conflicts', 0)} "
+                  "conflict(s) resolved)")
         if result.get("message"):
             print(f"  {result['message']}")
 
@@ -183,6 +171,14 @@ def cmd_push(args):
 def cmd_pull(args):
     repo = MutRepo(".")
     result = pull_op.pull(repo, force=args.force)
+
+    push_info = result.get("push")
+    if push_info and push_info.get("status") == "pushed":
+        print(f"Pushed {push_info['pushed']} unpushed snapshot(s) first")
+        if push_info.get("merged"):
+            print(f"  server auto-merged "
+                  f"({push_info.get('conflicts', 0)} conflict(s) resolved)")
+
     if result["status"] == "up-to-date":
         print("Already up-to-date")
     else:
@@ -202,24 +198,25 @@ def cmd_stats(args):
 def main():
     parser = argparse.ArgumentParser(
         prog="mut",
-        description="Mut — Managed Unified Tree. Version management for AI agents.",
+        description="Mut — Managed Unified Tree. "
+                    "Version management for AI agents.",
     )
     sub = parser.add_subparsers(dest="command")
 
     sub.add_parser("init", help="Initialize a .mut/ repository")
 
-    p_register = sub.add_parser("register", help="Register with a server using an invite URL")
-    p_register.add_argument("invite_url", help="Invite URL, e.g. http://server:9742/invite/abc123")
-
     p_clone = sub.add_parser("clone", help="Clone scope from server")
     p_clone.add_argument("url", help="Server URL, e.g. http://localhost:9742")
-    p_clone.add_argument("--token", default="", help="Auth token (auto from credentials if omitted)")
-    p_clone.add_argument("dir", nargs="?", default="",
-                         help="Target directory (default: auto from project name)")
+    p_clone.add_argument("--credential", default="",
+                         help="Auth credential (API key, token, etc.)")
+    p_clone.add_argument("--dir", default="",
+                         help="Target directory (default: auto from project)")
 
     p_commit = sub.add_parser("commit", help="Snapshot the working directory")
-    p_commit.add_argument("-m", "--message", required=True, help="Commit message")
-    p_commit.add_argument("-w", "--who", default="", help="Agent ID (auto from config if omitted)")
+    p_commit.add_argument("-m", "--message", required=True,
+                          help="Commit message")
+    p_commit.add_argument("-w", "--who", default="",
+                          help="Agent ID (auto from config if omitted)")
 
     sub.add_parser("log", help="Show snapshot history")
     sub.add_parser("status", help="Show changes since last snapshot")
@@ -231,7 +228,8 @@ def main():
     p_co = sub.add_parser("checkout", help="Restore to a snapshot")
     p_co.add_argument("id", type=int)
 
-    p_show = sub.add_parser("show", help="Show file at snapshot  e.g. mut show 1:main.py")
+    p_show = sub.add_parser("show",
+                            help="Show file at snapshot  e.g. mut show 1:main.py")
     p_show.add_argument("ref", help="<snapshot_id>:<path>")
 
     p_tree = sub.add_parser("tree", help="Show Merkle tree of a snapshot")
@@ -251,7 +249,6 @@ def main():
 
     dispatch = {
         "init": cmd_init,
-        "register": cmd_register,
         "clone": cmd_clone,
         "commit": cmd_commit,
         "log": cmd_log,

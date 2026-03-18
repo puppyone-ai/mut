@@ -76,24 +76,24 @@ with open('$SERVER_DIR/current/project/paper.pdf', 'wb') as f:
 
 # 10 agents sharing /project/
 for i in $(seq 1 10); do
-    $MUT_SERVER add-scope "$SERVER_DIR" --id "scope-$i" --scope-path "/project/" --agents "agent-$i" --mode rw 2>/dev/null
+    $MUT_SERVER add-scope "$SERVER_DIR" --id "scope-$i" --scope-path "/project/" 2>/dev/null
 done
 
-declare -a TOKENS
+declare -a CREDS
 for i in $(seq 1 10); do
-    TOKENS[$i]=$($MUT_SERVER issue-token "$SERVER_DIR" --agent "agent-$i")
+    CREDS[$i]=$($MUT_SERVER issue-credential "$SERVER_DIR" --scope "scope-$i" --agent "agent-$i" --mode rw)
 done
 
 # Also create isolated scopes for concurrency test
 for i in $(seq 1 20); do
     mkdir -p "$SERVER_DIR/current/isolated/agent-$i"
     echo "data v1 from agent-$i" > "$SERVER_DIR/current/isolated/agent-$i/data.txt"
-    $MUT_SERVER add-scope "$SERVER_DIR" --id "iso-$i" --scope-path "/isolated/agent-$i/" --agents "iso-$i" --mode rw 2>/dev/null
+    $MUT_SERVER add-scope "$SERVER_DIR" --id "iso-$i" --scope-path "/isolated/agent-$i/" 2>/dev/null
 done
 
-declare -a ISO_TOKENS
+declare -a ISO_CREDS
 for i in $(seq 1 20); do
-    ISO_TOKENS[$i]=$($MUT_SERVER issue-token "$SERVER_DIR" --agent "iso-$i")
+    ISO_CREDS[$i]=$($MUT_SERVER issue-credential "$SERVER_DIR" --scope "iso-$i" --agent "iso-$i" --mode rw)
 done
 
 $MUT_SERVER serve "$SERVER_DIR" --port $PORT &
@@ -114,7 +114,7 @@ echo "════════════════════════�
 for i in $(seq 1 5); do
     WDIR="$TESTDIR/w$i"
     mkdir -p "$WDIR" && cd "$WDIR"
-    $MUT clone "$SERVER_URL" --token "${TOKENS[$i]}" 2>/dev/null
+    $MUT clone "$SERVER_URL" --credential "${CREDS[$i]}" 2>/dev/null
 done
 
 W() { echo "$TESTDIR/w$1/async-test"; }
@@ -259,7 +259,7 @@ for i in $(seq 1 20); do
     mkdir -p "$WDIR"
     (
         cd "$WDIR"
-        $MUT clone "$SERVER_URL" --token "${ISO_TOKENS[$i]}" 2>/dev/null
+        $MUT clone "$SERVER_URL" --credential "${ISO_CREDS[$i]}" 2>/dev/null
     ) &
     PIDS="$PIDS $!"
 done
@@ -524,7 +524,7 @@ import urllib.request, json
 data = json.dumps({'protocol_version': 999}).encode()
 req = urllib.request.Request('http://127.0.0.1:$PORT/clone',
     data=data, headers={'Content-Type':'application/json',
-    'Authorization':'Bearer ${TOKENS[1]}'}, method='POST')
+    'Authorization':'Bearer ${CREDS[1]}'}, method='POST')
 try:
     urllib.request.urlopen(req, timeout=5)
     print('ACCEPTED')
@@ -540,7 +540,7 @@ import urllib.request, json
 data = json.dumps({'protocol_version': 1}).encode()
 req = urllib.request.Request('http://127.0.0.1:$PORT/clone',
     data=data, headers={'Content-Type':'application/json',
-    'Authorization':'Bearer ${TOKENS[1]}'}, method='POST')
+    'Authorization':'Bearer ${CREDS[1]}'}, method='POST')
 try:
     resp = urllib.request.urlopen(req, timeout=5)
     print('OK')
@@ -563,7 +563,7 @@ import urllib.request, json
 data = json.dumps({'hashes': ['../../etc/passwd', 'AAAA' * 100, '<script>']}).encode()
 req = urllib.request.Request('http://127.0.0.1:$PORT/negotiate',
     data=data, headers={'Content-Type':'application/json',
-    'Authorization':'Bearer ${TOKENS[1]}'}, method='POST')
+    'Authorization':'Bearer ${CREDS[1]}'}, method='POST')
 try:
     urllib.request.urlopen(req, timeout=5)
     print('ACCEPTED')
@@ -579,7 +579,7 @@ import urllib.request, json
 data = json.dumps({'hashes': ['abcdef1234567890']}).encode()
 req = urllib.request.Request('http://127.0.0.1:$PORT/negotiate',
     data=data, headers={'Content-Type':'application/json',
-    'Authorization':'Bearer ${TOKENS[1]}'}, method='POST')
+    'Authorization':'Bearer ${CREDS[1]}'}, method='POST')
 try:
     resp = urllib.request.urlopen(req, timeout=5)
     result = json.loads(resp.read())
@@ -635,7 +635,7 @@ import urllib.request, json
 data = json.dumps({}).encode()
 req = urllib.request.Request('http://127.0.0.1:$PORT/clone',
     data=data, headers={'Content-Type':'application/json',
-    'Authorization':'Bearer ${TOKENS[3]}'}, method='POST')
+    'Authorization':'Bearer ${CREDS[3]}'}, method='POST')
 try:
     resp = urllib.request.urlopen(req, timeout=10)
     result = json.loads(resp.read())
@@ -712,7 +712,7 @@ import urllib.request, json
 data = json.dumps({'since_version': 0, 'have_hashes': []}).encode()
 req = urllib.request.Request('http://127.0.0.1:$PORT/pull',
     data=data, headers={'Content-Type':'application/json',
-    'Authorization':'Bearer ${ISO_TOKENS[1]}'}, method='POST')
+    'Authorization':'Bearer ${ISO_CREDS[1]}'}, method='POST')
 try:
     resp = urllib.request.urlopen(req, timeout=10)
     result = json.loads(resp.read())
@@ -788,7 +788,7 @@ echo "════════════════════════�
 # Verify clone only writes files within scope
 CLONE_DIR="$TESTDIR/scope-check"
 mkdir -p "$CLONE_DIR" && cd "$CLONE_DIR"
-$MUT clone "$SERVER_URL" --token "${ISO_TOKENS[2]}" 2>/dev/null
+$MUT clone "$SERVER_URL" --credential "${ISO_CREDS[2]}" 2>/dev/null
 
 # iso-2 scope is /isolated/agent-2/ — should only have that agent's data
 CLONE_PROJECT="$CLONE_DIR/async-test"
