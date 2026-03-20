@@ -147,5 +147,5 @@ class TestServerRepoAudit:
     def test_record_audit(self, server_repo):
         server_repo.record_audit("test_event", "agent-A", {"key": "value"})
         # Audit is append-only files — just check no exception
-        audit_files = list(server_repo.audit.dir.iterdir())
+        audit_files = list(server_repo.audit._backend.dir.iterdir())
         assert len(audit_files) == 1

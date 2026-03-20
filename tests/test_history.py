@@ -2,7 +2,7 @@
 
 import pytest
 
-from mut.server.history import HistoryManager, _scopes_overlap, _redact_for_scope
+from mut.server.history import HistoryManager, FileSystemHistoryBackend, _scopes_overlap, _redact_for_scope
 from mut.foundation.fs import write_text
 
 
@@ -12,7 +12,7 @@ def history(tmp_path):
     d.mkdir()
     write_text(d / "latest", "0")
     write_text(d / "root", "")
-    return HistoryManager(d)
+    return HistoryManager(FileSystemHistoryBackend(d))
 
 
 class TestHistoryManager:

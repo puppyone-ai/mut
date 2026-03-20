@@ -1,36 +1,53 @@
-"""Server-side audit log with sync and async support."""
+"""Server-side audit log with pluggable backends."""
 
+from __future__ import annotations
+
+import abc
 import secrets
 from datetime import datetime, timezone
 from pathlib import Path
 
-from mut.foundation.fs import write_json, mkdir_p, async_write_json, async_mkdir_p
+from mut.foundation.fs import write_json, mkdir_p
 
 
-class AuditLog:
-    """Append-only audit log in .mut-server/audit/."""
+class AuditBackend(abc.ABC):
+    """Abstract interface for audit log storage."""
+
+    @abc.abstractmethod
+    def append(self, entry: dict) -> None: ...
+
+
+class FileSystemAuditBackend(AuditBackend):
+    """One JSON file per event in .mut-server/audit/."""
 
     def __init__(self, audit_dir: Path):
         self.dir = audit_dir
 
-    def _make_entry(self, event_type: str, agent_id: str, detail: dict) -> tuple:
+    def append(self, entry: dict) -> None:
+        mkdir_p(self.dir)
         ts = datetime.now(timezone.utc)
-        uid = secrets.token_hex(2)  # 4-char hex to avoid filename collisions
-        filename = ts.strftime("%Y%m%d_%H%M%S") + f"_{uid}_{agent_id}_{event_type}.json"
+        uid = secrets.token_hex(2)
+        agent = entry.get("agent", "unknown")
+        event_type = entry.get("type", "unknown")
+        filename = ts.strftime("%Y%m%d_%H%M%S") + f"_{uid}_{agent}_{event_type}.json"
+        write_json(self.dir / filename, entry)
+
+
+class AuditLog:
+    """Append-only audit log via a pluggable AuditBackend."""
+
+    def __init__(self, backend: AuditBackend):
+        self._backend = backend
+
+    def record(self, event_type: str, agent_id: str, detail: dict):
         entry = {
             "type": event_type,
             "agent": agent_id,
-            "time": ts.isoformat(timespec="seconds"),
+            "time": datetime.now(timezone.utc).isoformat(timespec="seconds"),
             **detail,
         }
-        return filename, entry
-
-    def record(self, event_type: str, agent_id: str, detail: dict):
-        mkdir_p(self.dir)
-        filename, entry = self._make_entry(event_type, agent_id, detail)
-        write_json(self.dir / filename, entry)
+        self._backend.append(entry)
 
     async def async_record(self, event_type: str, agent_id: str, detail: dict):
-        await async_mkdir_p(self.dir)
-        filename, entry = self._make_entry(event_type, agent_id, detail)
-        await async_write_json(self.dir / filename, entry)
+        import asyncio
+        await asyncio.to_thread(self.record, event_type, agent_id, detail)

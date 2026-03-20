@@ -1,24 +1,46 @@
-"""Server-side version history management with sync and async support.
+"""Server-side version history management with pluggable backends.
 
-Bug fix: conflict records now persist lost_content and lost_hash fields
+Conflict records persist lost_content and lost_hash fields
 for full auditability and recovery of overwritten content.
 """
 
 from __future__ import annotations
 
+import abc
 from datetime import datetime, timezone
 from pathlib import Path
 
 from mut.foundation.config import normalize_path
-from mut.foundation.fs import (
-    read_json, write_json, write_text,
-    async_read_json, async_write_json, async_write_text, async_read_text,
-    async_exists,
-)
+from mut.foundation.fs import read_json, write_json, write_text
 
 
-class HistoryManager:
-    """Manages version history in .mut-server/history/."""
+class HistoryBackend(abc.ABC):
+    """Abstract interface for version history storage."""
+
+    @abc.abstractmethod
+    def get_latest_version(self) -> int: ...
+
+    @abc.abstractmethod
+    def set_latest_version(self, version: int) -> None: ...
+
+    @abc.abstractmethod
+    def get_root_hash(self) -> str: ...
+
+    @abc.abstractmethod
+    def set_root_hash(self, h: str) -> None: ...
+
+    @abc.abstractmethod
+    def record(self, version: int, entry: dict) -> None: ...
+
+    @abc.abstractmethod
+    def get_entry(self, version: int) -> dict | None: ...
+
+    @abc.abstractmethod
+    def get_since(self, since_version: int, limit: int = 0) -> list[dict]: ...
+
+
+class FileSystemHistoryBackend(HistoryBackend):
+    """JSON files in .mut-server/history/."""
 
     LATEST_FILE = "latest"
     ROOT_FILE = "root"
@@ -26,9 +48,51 @@ class HistoryManager:
     def __init__(self, history_dir: Path):
         self.dir = history_dir
 
+    def get_latest_version(self) -> int:
+        return int((self.dir / self.LATEST_FILE).read_text().strip())
+
+    def set_latest_version(self, version: int) -> None:
+        write_text(self.dir / self.LATEST_FILE, str(version))
+
+    def get_root_hash(self) -> str:
+        root_file = self.dir / self.ROOT_FILE
+        if not root_file.exists():
+            return ""
+        return root_file.read_text().strip()
+
+    def set_root_hash(self, h: str) -> None:
+        write_text(self.dir / self.ROOT_FILE, h)
+
+    def record(self, version: int, entry: dict) -> None:
+        write_json(self.dir / f"{version:06d}.json", entry)
+
+    def get_entry(self, version: int) -> dict | None:
+        path = self.dir / f"{version:06d}.json"
+        if path.exists():
+            return read_json(path)
+        return None
+
+    def get_since(self, since_version: int, limit: int = 0) -> list[dict]:
+        latest = self.get_latest_version()
+        start = since_version + 1
+        if limit > 0:
+            start = max(start, latest - limit + 1)
+        result = []
+        for v in range(start, latest + 1):
+            entry = self.get_entry(v)
+            if entry is not None:
+                result.append(entry)
+        return result
+
+
+class HistoryManager:
+    """Manages version history via a pluggable HistoryBackend."""
+
+    def __init__(self, backend: HistoryBackend):
+        self._backend = backend
+
     @staticmethod
     def _serialize_conflicts(conflicts: list) -> list:
-        """Serialize ConflictRecord objects to dicts, including lost_content and lost_hash."""
         return [
             {"path": c.path, "strategy": c.strategy, "detail": c.detail,
              "kept": c.kept, "lost_content": c.lost_content, "lost_hash": c.lost_hash}
@@ -51,137 +115,87 @@ class HistoryManager:
             entry["conflicts"] = self._serialize_conflicts(conflicts)
         return entry
 
-    # ── Sync methods ──────────────────────────────
-
     def get_latest_version(self) -> int:
-        return int((self.dir / self.LATEST_FILE).read_text().strip())
+        return self._backend.get_latest_version()
 
     def set_latest_version(self, version: int):
-        write_text(self.dir / self.LATEST_FILE, str(version))
+        self._backend.set_latest_version(version)
 
     def get_root_hash(self) -> str:
-        root_file = self.dir / self.ROOT_FILE
-        if not root_file.exists():
-            return ""
-        return root_file.read_text().strip()
+        return self._backend.get_root_hash()
 
     def set_root_hash(self, h: str):
-        write_text(self.dir / self.ROOT_FILE, h)
+        self._backend.set_root_hash(h)
 
     def record(self, version: int, who: str, message: str,
                scope_path: str, changes: list,
                conflicts: list | None = None, root_hash: str = ""):
         entry = self._make_entry(version, who, message, scope_path, changes,
                                  conflicts, root_hash)
-        write_json(self.dir / f"{version:06d}.json", entry)
+        self._backend.record(version, entry)
 
     def get_since(self, since_version: int, scope_path: str | None = None,
                    limit: int = 0) -> list:
-        """Return history entries after since_version.
-
-        If scope_path is given, only entries whose scope overlaps
-        with scope_path are included (prevents cross-scope info leak).
-        If limit > 0, return at most that many entries (most recent).
-        """
-        result: list[dict] = []
-        latest = self.get_latest_version()
+        entries = self._backend.get_since(since_version, limit)
         norm_scope = normalize_path(scope_path) if scope_path else None
-
-        # When limit is set, scan backwards to get the most recent entries
-        start = since_version + 1
-        if limit > 0:
-            start = max(start, latest - limit + 1)
-
-        for v in range(start, latest + 1):
-            entry = self.get_entry(v)
-            if entry is None:
+        if norm_scope is None:
+            return entries
+        result = []
+        for entry in entries:
+            if not _scopes_overlap(entry.get("scope", "/"), norm_scope):
                 continue
-            if norm_scope is not None:
-                if not _scopes_overlap(entry.get("scope", "/"), norm_scope):
-                    continue
-                entry = _redact_for_scope(entry, norm_scope)
-            result.append(entry)
+            result.append(_redact_for_scope(entry, norm_scope))
         return result
 
     def get_entry(self, version: int) -> dict | None:
-        path = self.dir / f"{version:06d}.json"
-        if path.exists():
-            return read_json(path)
-        return None
-
-    # ── Async methods ─────────────────────────────
+        return self._backend.get_entry(version)
 
     async def async_get_latest_version(self) -> int:
-        text = await async_read_text(self.dir / self.LATEST_FILE)
-        return int(text)
+        import asyncio
+        return await asyncio.to_thread(self.get_latest_version)
 
     async def async_set_latest_version(self, version: int):
-        await async_write_text(self.dir / self.LATEST_FILE, str(version))
+        import asyncio
+        await asyncio.to_thread(self.set_latest_version, version)
 
     async def async_get_root_hash(self) -> str:
-        root_file = self.dir / self.ROOT_FILE
-        if not await async_exists(root_file):
-            return ""
-        return await async_read_text(root_file)
+        import asyncio
+        return await asyncio.to_thread(self.get_root_hash)
 
     async def async_set_root_hash(self, h: str):
-        await async_write_text(self.dir / self.ROOT_FILE, h)
+        import asyncio
+        await asyncio.to_thread(self.set_root_hash, h)
 
     async def async_record(self, version: int, who: str, message: str,
                            scope_path: str, changes: list,
                            conflicts: list | None = None, root_hash: str = ""):
-        entry = self._make_entry(version, who, message, scope_path, changes,
-                                 conflicts, root_hash)
-        await async_write_json(self.dir / f"{version:06d}.json", entry)
+        import asyncio
+        await asyncio.to_thread(
+            self.record, version, who, message, scope_path,
+            changes, conflicts, root_hash,
+        )
 
     async def async_get_since(self, since_version: int,
                               scope_path: str | None = None,
                               limit: int = 0) -> list:
-        result: list[dict] = []
-        latest = await self.async_get_latest_version()
-        norm_scope = normalize_path(scope_path) if scope_path else None
-
-        start = since_version + 1
-        if limit > 0:
-            start = max(start, latest - limit + 1)
-
-        for v in range(start, latest + 1):
-            entry = await self.async_get_entry(v)
-            if entry is None:
-                continue
-            if norm_scope is not None:
-                if not _scopes_overlap(entry.get("scope", "/"), norm_scope):
-                    continue
-                entry = _redact_for_scope(entry, norm_scope)
-            result.append(entry)
-        return result
+        import asyncio
+        return await asyncio.to_thread(self.get_since, since_version, scope_path, limit)
 
     async def async_get_entry(self, version: int) -> dict | None:
-        path = self.dir / f"{version:06d}.json"
-        if await async_exists(path):
-            return await async_read_json(path)
-        return None
+        import asyncio
+        return await asyncio.to_thread(self.get_entry, version)
 
-
-# ── Module-level helpers ─────────────────────
 
 def _scopes_overlap(entry_scope: str, requesting_scope: str) -> bool:
-    """Check if two scope paths overlap (one is prefix of the other)."""
     es = normalize_path(entry_scope)
-    rs = requesting_scope  # already normalized by caller
+    rs = requesting_scope
     if not es or not rs:
         return True
     return (es.startswith(rs + "/") or rs.startswith(es + "/") or es == rs)
 
 
 def _redact_for_scope(entry: dict, scope: str) -> dict:
-    """Strip details outside the requesting scope.
-
-    - Filters changes and conflicts to only in-scope paths
-    - Removes global root hash (leaks full project tree)
-    """
     redacted = dict(entry)
-    # Never expose the global root hash to scoped agents
     redacted.pop("root", None)
     if "changes" in entry:
         redacted["changes"] = [

@@ -38,9 +38,9 @@ from mut.foundation.fs import (
 from mut.core.object_store import ObjectStore
 from mut.core.ignore import IgnoreRules
 from mut.core import tree as tree_mod
-from mut.server.scope_manager import ScopeManager
-from mut.server.history import HistoryManager
-from mut.server.audit import AuditLog
+from mut.server.scope_manager import ScopeManager, ScopeBackend, FileSystemScopeBackend
+from mut.server.history import HistoryManager, FileSystemHistoryBackend
+from mut.server.audit import AuditLog, FileSystemAuditBackend
 
 
 class ServerRepo:
@@ -52,9 +52,9 @@ class ServerRepo:
         self.current = self.root / SERVER_CURRENT_DIR
         self.store = ObjectStore(self.meta / SERVER_OBJECTS_DIR)
 
-        self.scopes = ScopeManager(self.meta / SERVER_SCOPES_DIR)
-        self.history = HistoryManager(self.meta / SERVER_HISTORY_DIR)
-        self.audit = AuditLog(self.meta / SERVER_AUDIT_DIR)
+        self.scopes = ScopeManager(FileSystemScopeBackend(self.meta / SERVER_SCOPES_DIR))
+        self.history = HistoryManager(FileSystemHistoryBackend(self.meta / SERVER_HISTORY_DIR))
+        self.audit = AuditLog(FileSystemAuditBackend(self.meta / SERVER_AUDIT_DIR))
         self.locks_dir = self.meta / SERVER_LOCKS_DIR
 
         self._global_lock: asyncio.Lock | None = None
