@@ -5,7 +5,7 @@ import pytest
 
 from mut.server.auth.api_key import ApiKeyAuth
 from mut.server.auth.no_auth import NoAuth
-from mut.server.scope_manager import ScopeManager
+from mut.server.scope_manager import ScopeManager, FileSystemScopeBackend
 from mut.foundation.error import AuthenticationError, PermissionDenied
 
 
@@ -23,7 +23,7 @@ def scope_manager(tmp_path):
     """ScopeManager with a test scope defined."""
     scopes_dir = tmp_path / "scopes"
     scopes_dir.mkdir()
-    sm = ScopeManager(scopes_dir)
+    sm = ScopeManager(FileSystemScopeBackend(scopes_dir))
     sm.add("scope-src", "/src/")
     return sm
 
