@@ -186,6 +186,67 @@ class HistoryManager:
         return await asyncio.to_thread(self.get_entry, version)
 
 
+    def migrate_scope(self, old_scope_path: str,
+                      new_scope_map: dict[str, str],
+                      fallback_scope: str = "/") -> int:
+        """Re-attribute history entries when scopes change.
+
+        old_scope_path: the scope being split/changed (e.g. "docs")
+        new_scope_map: {path_prefix: new_scope_path} for routing
+            e.g. {"docs/internal": "docs/internal", "docs/public": "docs/public"}
+        fallback_scope: where to assign entries that don't match any new scope
+
+        Returns the number of entries migrated.
+        """
+        old_norm = normalize_path(old_scope_path)
+        latest = self._backend.get_latest_version()
+        count = 0
+
+        for v in range(1, latest + 1):
+            entry = self._backend.get_entry(v)
+            if entry is None:
+                continue
+            entry_scope = normalize_path(entry.get("scope", "/"))
+            if entry_scope != old_norm:
+                continue
+
+            # Determine the best new scope based on changes
+            best_scope = self._pick_new_scope(
+                entry.get("changes", []), new_scope_map, fallback_scope,
+            )
+            entry["scope"] = best_scope
+            self._backend.record(v, entry)
+            count += 1
+
+        return count
+
+    @staticmethod
+    def _pick_new_scope(changes: list[dict],
+                        new_scope_map: dict[str, str],
+                        fallback: str) -> str:
+        """Pick the best new scope for a history entry based on its changes."""
+        if not changes:
+            return fallback
+
+        # Count how many changes fall under each new scope
+        votes: dict[str, int] = {}
+        for change in changes:
+            path = normalize_path(change.get("path", ""))
+            matched = False
+            for prefix, new_scope in new_scope_map.items():
+                norm_prefix = normalize_path(prefix)
+                if path.startswith(norm_prefix + "/") or path == norm_prefix:
+                    votes[new_scope] = votes.get(new_scope, 0) + 1
+                    matched = True
+                    break
+            if not matched:
+                votes[fallback] = votes.get(fallback, 0) + 1
+
+        if not votes:
+            return fallback
+        return max(votes, key=votes.get)
+
+
 def _scopes_overlap(entry_scope: str, requesting_scope: str) -> bool:
     es = normalize_path(entry_scope)
     rs = requesting_scope

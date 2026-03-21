@@ -36,6 +36,7 @@ from mut.ops import (
     tree_op,
     push_op,
     pull_op,
+    rollback_op,
     stats_op,
 )
 
@@ -148,6 +149,27 @@ def cmd_tree(args):
     print(tree_op.tree(repo, args.id))
 
 
+def cmd_remote(args):
+    repo = MutRepo(".")
+    from mut.foundation.config import load_config, save_config
+    config = load_config(repo.mut_root)
+
+    if args.action == "add":
+        config["server"] = args.url
+        save_config(repo.mut_root, config)
+        print(f"Remote set to {args.url}")
+    elif args.action == "remove":
+        config.pop("server", None)
+        save_config(repo.mut_root, config)
+        print("Remote removed")
+    elif args.action == "show":
+        server = config.get("server", "")
+        if server:
+            print(f"  origin  {server}")
+        else:
+            print("  (no remote configured)")
+
+
 def cmd_push(args):
     repo = MutRepo(".")
     result = push_op.push(repo)
@@ -185,6 +207,19 @@ def cmd_pull(args):
         print(f"Pulled {result['pulled']} file(s) from server")
         if result.get("server_version"):
             print(f"  server version: {result['server_version']}")
+
+
+def cmd_rollback(args):
+    repo = MutRepo(".")
+    result = rollback_op.rollback(repo, args.version)
+    if result["status"] == "already-at-version":
+        print(f"Already at version {args.version}")
+    else:
+        print(f"Rolled back to v{result['target_version']}")
+        print(f"  new server version: v{result['new_version']}")
+        changes = result.get("changes", [])
+        if changes:
+            print(f"  {len(changes)} file(s) changed")
 
 
 def cmd_stats(args):
@@ -235,10 +270,22 @@ def main():
     p_tree = sub.add_parser("tree", help="Show Merkle tree of a snapshot")
     p_tree.add_argument("id", type=int)
 
+    p_remote = sub.add_parser("remote", help="Manage server remote")
+    p_remote.add_argument("action", choices=["add", "remove", "show"],
+                          help="add <url>, remove, or show")
+    p_remote.add_argument("url", nargs="?", default="",
+                          help="Server URL (for 'add' action)")
+
     sub.add_parser("push", help="Push local snapshots to server")
     p_pull = sub.add_parser("pull", help="Pull new snapshots from server")
     p_pull.add_argument("--force", action="store_true",
                         help="Overwrite uncommitted local changes")
+
+    p_rollback = sub.add_parser("rollback",
+                                help="Rollback server to a historical version")
+    p_rollback.add_argument("version", type=int,
+                            help="Target version number to rollback to")
+
     sub.add_parser("stats", help="Repository statistics")
 
     args = parser.parse_args()
@@ -257,8 +304,10 @@ def main():
         "checkout": cmd_checkout,
         "show": cmd_show,
         "tree": cmd_tree,
+        "remote": cmd_remote,
         "push": cmd_push,
         "pull": cmd_pull,
+        "rollback": cmd_rollback,
         "stats": cmd_stats,
     }
 

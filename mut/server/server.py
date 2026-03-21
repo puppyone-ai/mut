@@ -26,12 +26,16 @@ from mut.core.merge import merge_file_sets
 from mut.core.scope import check_path_permission
 from mut.core import tree as tree_mod
 from mut.foundation.error import (
-    MutError, PermissionDenied, LockError,
+    MutError, PermissionDenied,
     ObjectNotFoundError, PayloadTooLargeError,
 )
 from mut.server.auth.base import Authenticator
 from mut.server.repo import ServerRepo
 from mut.server.graft import async_graft_subtree
+from mut.server.notification import NotificationManager
+from mut.server.websocket import (
+    WebSocketManager, WebSocketClient, do_ws_handshake, _read_ws_frame,
+)
 
 
 MAX_BODY_SIZE = 256 * 1024 * 1024  # 256 MB
@@ -145,14 +149,12 @@ async def _handle_push(repo: ServerRepo, auth: dict, body: dict) -> dict:
     if scope.get("mode", "r") == "r":
         raise PermissionDenied("scope is read-only")
 
-    scope_id = scope["id"]
-    scope_lock = repo._get_scope_lock(scope_id)
-
-    if scope_lock.locked():
-        raise LockError("scope is locked by another push, retry later")
-
-    async with scope_lock:
+    scope_path = scope.get("path", "")
+    await repo._scope_queue.acquire(scope_path)
+    try:
         return await _push_locked(repo, scope, auth, body)
+    finally:
+        repo._scope_queue.release(scope_path)
 
 
 async def _push_locked(repo: ServerRepo, scope: dict, auth: dict,
@@ -243,6 +245,15 @@ async def _push_locked(repo: ServerRepo, scope: dict, auth: dict,
     if merge_conflicts:
         result["merged"] = True
         result["conflicts"] = len(merge_conflicts)
+
+    # Fire post-push hook (notifications, etc.)
+    hook = getattr(repo, '_post_push_hook', None)
+    if hook is not None:
+        try:
+            await hook(scope["path"], new_version, auth["agent"], changes)
+        except Exception as exc:
+            print(f"[mut-server] warning: post-push hook failed: {exc}")
+
     return result
 
 
@@ -259,6 +270,27 @@ async def _handle_negotiate(repo: ServerRepo, _auth: dict, body: dict) -> dict:
         if not await repo.store.async_exists(h):
             missing.append(h)
     return {"missing": missing}
+
+
+async def _handle_rollback(repo: ServerRepo, auth: dict, body: dict) -> dict:
+    """Rollback to a historical version (async wrapper around sync handler)."""
+    scope = auth["_scope"]
+    if scope.get("mode", "r") == "r":
+        raise PermissionDenied("scope is read-only")
+
+    scope_path = scope.get("path", "")
+    await repo._scope_queue.acquire(scope_path)
+    try:
+        from mut.server.handlers import handle_rollback
+        return await asyncio.to_thread(handle_rollback, repo, auth, body)
+    finally:
+        repo._scope_queue.release(scope_path)
+
+
+async def _handle_pull_version(repo: ServerRepo, auth: dict, body: dict) -> dict:
+    """Pull files at a specific historical version."""
+    from mut.server.handlers import handle_pull_version
+    return await asyncio.to_thread(handle_pull_version, repo, auth, body)
 
 
 async def _handle_pull(repo: ServerRepo, auth: dict, body: dict) -> dict:
@@ -313,6 +345,8 @@ _POST_ROUTES = {
     "/push": _handle_push,
     "/pull": _handle_pull,
     "/negotiate": _handle_negotiate,
+    "/rollback": _handle_rollback,
+    "/pull-version": _handle_pull_version,
 }
 
 
@@ -347,9 +381,20 @@ async def _dispatch(repo: ServerRepo, authenticator: Authenticator,
 
 async def _handle_connection(repo: ServerRepo, authenticator: Authenticator,
                              reader: asyncio.StreamReader,
-                             writer: asyncio.StreamWriter):
+                             writer: asyncio.StreamWriter,
+                             ws_mgr: WebSocketManager | None = None):
     try:
         method, path, headers = await _read_request(reader)
+
+        # WebSocket upgrade for /ws
+        if (method == "GET" and path == "/ws"
+                and "upgrade" in headers.get("connection", "").lower()
+                and ws_mgr is not None):
+            await _handle_ws_upgrade(
+                repo, authenticator, reader, writer, headers, ws_mgr,
+            )
+            return
+
         body = await _read_body(reader, headers)
         result, status = await _dispatch(repo, authenticator,
                                          method, path, headers, body)
@@ -368,6 +413,54 @@ async def _handle_connection(repo: ServerRepo, authenticator: Authenticator,
             await writer.wait_closed()
         except ConnectionError:
             pass
+
+
+async def _handle_ws_upgrade(_repo: ServerRepo, authenticator: Authenticator,
+                             reader: asyncio.StreamReader,
+                             writer: asyncio.StreamWriter,
+                             headers: dict,
+                             ws_mgr: WebSocketManager):
+    """Handle WebSocket upgrade and run the notification loop."""
+    try:
+        auth = await authenticator.authenticate(headers, {})
+    except MutError:
+        await _send_error(writer, 401, "authentication failed")
+        writer.close()
+        return
+
+    if not await do_ws_handshake(writer, headers):
+        writer.close()
+        return
+
+    client_id = auth["agent"]
+    scope_path = auth["_scope"].get("path", "")
+    ws_client = WebSocketClient(
+        client_id=client_id, scope_path=scope_path,
+        writer=writer, reader=reader,
+    )
+    ws_mgr.register(ws_client)
+
+    # Flush any offline queued notifications
+    await ws_mgr.flush_offline(ws_client)
+
+    # Keep connection alive — read frames (pong/ack/close)
+    try:
+        while not ws_client.is_closed:
+            frame = await _read_ws_frame(reader)
+            if frame is None:
+                break
+            opcode, _data = frame
+            if opcode == 0x8:  # close
+                break
+            # 0x9 = ping → send pong
+            if opcode == 0x9:
+                from mut.server.websocket import _send_ws_frame
+                await _send_ws_frame(writer, _data, opcode=0xA)
+    except (ConnectionError, asyncio.IncompleteReadError):
+        pass
+    finally:
+        ws_mgr.unregister(client_id)
+        await ws_client.close()
 
 
 # ── Shared helpers ────────────────────────────
@@ -457,7 +550,8 @@ _GRACEFUL_TIMEOUT = 10
 
 async def async_serve(repo_root: str, host: str = "127.0.0.1",
                       port: int = 9742,
-                      authenticator: Authenticator | None = None):
+                      authenticator: Authenticator | None = None,
+                      notification_manager: NotificationManager | None = None):
     """Start the async Mut HTTP server with pluggable auth."""
     from mut.server.auth import NoAuth
 
@@ -466,6 +560,21 @@ async def async_serve(repo_root: str, host: str = "127.0.0.1",
 
     if authenticator is None:
         authenticator = NoAuth(repo.scopes)
+
+    if notification_manager is None:
+        notification_manager = NotificationManager(repo.get_project_name())
+
+    ws_manager = WebSocketManager()
+
+    async def _post_push_hook(scope_path, version, pushed_by, changes):
+        notif = notification_manager.create_notification(
+            scope_path, version, pushed_by, changes,
+        )
+        await ws_manager.broadcast(
+            notif.to_dict(), exclude=pushed_by, scope_path=scope_path,
+        )
+
+    repo._post_push_hook = _post_push_hook
 
     if not repo.get_root_hash():
         root = repo.build_full_tree()
@@ -481,7 +590,8 @@ async def async_serve(repo_root: str, host: str = "127.0.0.1",
         task = asyncio.current_task()
         active_tasks.add(task)
         try:
-            await _handle_connection(repo, authenticator, reader, writer)
+            await _handle_connection(repo, authenticator, reader, writer,
+                                     ws_mgr=ws_manager)
         finally:
             active_tasks.discard(task)
 
@@ -506,6 +616,9 @@ async def async_serve(repo_root: str, host: str = "127.0.0.1",
         raise
     finally:
         await authenticator.close()
+        await notification_manager.close()
+        await ws_manager.close_all()
+        repo._post_push_hook = None
         if server.is_serving():
             server.close()
             await server.wait_closed()

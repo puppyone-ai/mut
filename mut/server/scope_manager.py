@@ -34,6 +34,22 @@ class ScopeBackend(abc.ABC):
     @abc.abstractmethod
     def list_all(self) -> list[dict]: ...
 
+    def find_by_path_prefix(self, path_prefix: str) -> list[dict]:
+        """Find scopes whose path starts with the given prefix.
+
+        Default implementation filters list_all(); backends with indexed
+        storage (e.g. PuppyOne's SupabaseScopeBackend) can override for
+        better performance.
+        """
+        from mut.foundation.config import normalize_path
+        prefix = normalize_path(path_prefix)
+        results = []
+        for scope in self.list_all():
+            sp = normalize_path(scope.get("path", ""))
+            if not prefix or sp.startswith(prefix + "/") or sp == prefix:
+                results.append(scope)
+        return results
+
 
 class FileSystemScopeBackend(ScopeBackend):
     """One JSON file per scope in .mut-server/scopes/."""
@@ -88,6 +104,9 @@ class ScopeManager:
     def list_all(self) -> list[dict]:
         return self._backend.list_all()
 
+    def find_by_path_prefix(self, path_prefix: str) -> list[dict]:
+        return self._backend.find_by_path_prefix(path_prefix)
+
     def update_path(self, scope_id: str, new_path: str) -> dict | None:
         """Update the path of an existing scope (e.g. after folder rename)."""
         scope = self._backend.get(scope_id)
@@ -96,3 +115,41 @@ class ScopeManager:
         scope["path"] = new_path
         self._backend.put(scope_id, scope)
         return scope
+
+    def split_scope(self, old_scope_id: str,
+                    new_scopes: list[dict]) -> list[dict]:
+        """Split one scope into multiple new scopes.
+
+        Each entry in new_scopes should be {"id": ..., "path": ..., "exclude": [...]}.
+        The old scope is deleted after new scopes are created.
+        Returns the list of created scope dicts.
+        """
+        old = self._backend.get(old_scope_id)
+        if not old:
+            raise ValueError(f"scope '{old_scope_id}' not found")
+
+        created = []
+        for ns in new_scopes:
+            scope = self.add(ns["id"], ns["path"], ns.get("exclude"))
+            created.append(scope)
+
+        self._backend.delete(old_scope_id)
+        return created
+
+    def merge_scopes(self, scope_ids: list[str],
+                     new_scope_id: str, new_path: str,
+                     new_exclude: list | None = None) -> dict:
+        """Merge multiple scopes into a single new scope.
+
+        Old scopes are deleted. Returns the new scope dict.
+        """
+        for sid in scope_ids:
+            if not self._backend.get(sid):
+                raise ValueError(f"scope '{sid}' not found")
+
+        new_scope = self.add(new_scope_id, new_path, new_exclude)
+
+        for sid in scope_ids:
+            self._backend.delete(sid)
+
+        return new_scope

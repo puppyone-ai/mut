@@ -17,7 +17,8 @@ from mut.core.merge import merge_file_sets
 from mut.core.object_store import ObjectStore
 from mut.core.protocol import (
     CloneResponse, PushRequest, PushResponse, PullRequest, PullResponse,
-    NegotiateRequest, NegotiateResponse, ScopeInfo, normalize_path,
+    NegotiateRequest, NegotiateResponse, RollbackRequest, RollbackResponse,
+    PullVersionRequest, ScopeInfo, normalize_path,
 )
 from mut.core.scope import check_path_permission
 from mut.core import tree as tree_mod
@@ -215,6 +216,140 @@ def handle_pull(repo: ServerRepo, auth: dict, body: dict) -> dict:
         files=files_b64,
         objects=objects_b64,
         history=history,
+    ).to_dict()
+
+
+# ── Pull Version ──────────────────────────────
+
+def handle_pull_version(repo: ServerRepo, auth: dict, body: dict) -> dict:
+    """Pull files at a specific historical version (not just latest)."""
+    scope = auth["_scope"]
+    req = PullVersionRequest.from_dict(body)
+    target_version = req.version
+
+    current = repo.get_latest_version()
+    if target_version <= 0 or target_version > current:
+        raise ValueError(
+            f"invalid version {target_version} (current: {current})"
+        )
+
+    entry = repo.get_history_entry(target_version)
+    if not entry or not entry.get("root"):
+        raise ValueError(f"version {target_version} has no root hash")
+
+    target_root = entry["root"]
+    if not repo.store.exists(target_root):
+        raise ObjectNotFoundError(
+            f"root object for version {target_version} not found"
+        )
+
+    scope_prefix = normalize_path(scope["path"])
+    parts = scope_prefix.split("/") if scope_prefix else []
+    subtree_hash = _navigate_tree(repo.store, target_root, parts)
+
+    files_b64 = {}
+    objects_b64 = {}
+    if subtree_hash:
+        from mut.core import tree as tree_mod
+        flat = tree_mod.tree_to_flat(repo.store, subtree_hash)
+        for path, h in flat.items():
+            files_b64[path] = base64.b64encode(repo.store.get(h)).decode()
+        reachable = tree_mod.collect_reachable_hashes(repo.store, subtree_hash)
+        objects_b64 = {h: base64.b64encode(repo.store.get(h)).decode()
+                       for h in reachable}
+
+    repo.record_audit("pull_version", auth["agent"], {
+        "scope": scope["path"],
+        "version": target_version,
+    })
+
+    return {
+        "status": "ok",
+        "version": target_version,
+        "files": files_b64,
+        "objects": objects_b64,
+    }
+
+
+# ── Rollback ──────────────────────────────────
+
+def handle_rollback(repo: ServerRepo, auth: dict, body: dict) -> dict:
+    """Rollback to a historical version by creating a revert commit.
+
+    The version chain continues forward — rollback creates a NEW version
+    whose content equals the target historical version's snapshot.
+    """
+    scope = auth["_scope"]
+    if scope.get("mode", "r") == "r":
+        raise PermissionDenied("scope is read-only")
+
+    req = RollbackRequest.from_dict(body)
+    target_version = req.target_version
+    current_version = repo.get_latest_version()
+
+    if target_version <= 0 or target_version > current_version:
+        raise ValueError(
+            f"invalid target version {target_version} "
+            f"(current: {current_version})"
+        )
+    if target_version == current_version:
+        return RollbackResponse(
+            status="already-at-version",
+            new_version=current_version,
+            target_version=target_version,
+        ).to_dict()
+
+    target_entry = repo.get_history_entry(target_version)
+    if not target_entry or not target_entry.get("root"):
+        raise ValueError(f"version {target_version} has no root hash")
+
+    target_root = target_entry["root"]
+    if not repo.store.exists(target_root):
+        raise ObjectNotFoundError(
+            f"root object for version {target_version} not found"
+        )
+
+    # Compute changes between current and target for the audit trail
+    scope_prefix = normalize_path(scope["path"])
+    parts = scope_prefix.split("/") if scope_prefix else []
+
+    current_files = repo.list_scope_files(scope)
+
+    target_subtree = _navigate_tree(repo.store, target_root, parts)
+    target_files = {}
+    if target_subtree:
+        target_files = _flatten_tree_to_bytes(repo.store, target_subtree)
+
+    # Compute changeset
+    changes = _compute_changeset(scope_prefix, current_files, target_files)
+
+    # Apply target files to current/
+    _apply_merged_files(repo, scope, current_files, target_files)
+
+    # Graft and update version
+    new_root = _graft_scope_tree(repo, scope, scope_prefix)
+    new_version = current_version + 1
+
+    repo.record_history(
+        new_version, auth["agent"],
+        f"rollback to v{target_version}",
+        scope["path"], changes,
+        root_hash=new_root,
+    )
+    repo.set_latest_version(new_version)
+    repo.set_root_hash(new_root)
+
+    repo.record_audit("rollback", auth["agent"], {
+        "scope": scope["path"],
+        "target_version": target_version,
+        "new_version": new_version,
+    })
+
+    return RollbackResponse(
+        status="rolled-back",
+        new_version=new_version,
+        target_version=target_version,
+        changes=changes,
     ).to_dict()
 
 
