@@ -38,9 +38,10 @@ from mut.foundation.fs import (
 from mut.core.object_store import ObjectStore
 from mut.core.ignore import IgnoreRules
 from mut.core import tree as tree_mod
-from mut.server.scope_manager import ScopeManager, ScopeBackend, FileSystemScopeBackend
+from mut.server.scope_manager import ScopeManager, FileSystemScopeBackend
 from mut.server.history import HistoryManager, FileSystemHistoryBackend
 from mut.server.audit import AuditLog, FileSystemAuditBackend
+from mut.server.sync_queue import ScopeQueue
 
 
 class ServerRepo:
@@ -58,26 +59,12 @@ class ServerRepo:
         self.locks_dir = self.meta / SERVER_LOCKS_DIR
 
         self._global_lock: asyncio.Lock | None = None
-        self._scope_locks: dict[str, asyncio.Lock] = {}
-        self._MAX_SCOPE_LOCKS = 1000
+        self._scope_queue = ScopeQueue()
 
     def _ensure_global_lock(self) -> asyncio.Lock:
         if self._global_lock is None:
             self._global_lock = asyncio.Lock()
         return self._global_lock
-
-    def _get_scope_lock(self, scope_id: str) -> asyncio.Lock:
-        """Get or create an asyncio.Lock for a scope, with lazy eviction."""
-        if scope_id not in self._scope_locks:
-            if len(self._scope_locks) >= self._MAX_SCOPE_LOCKS:
-                self._evict_idle_locks()
-            self._scope_locks[scope_id] = asyncio.Lock()
-        return self._scope_locks[scope_id]
-
-    def _evict_idle_locks(self):
-        idle = [k for k, v in self._scope_locks.items() if not v.locked()]
-        for k in idle:
-            del self._scope_locks[k]
 
     # ── Init ──────────────────────────────────────
 

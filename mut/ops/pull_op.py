@@ -17,7 +17,7 @@ import base64
 
 from mut.ops.repo import MutRepo
 from mut.foundation.config import (
-    REMOTE_HEAD_FILE, CREDENTIAL_FILE, HEAD_FILE, load_config,
+    REMOTE_HEAD_FILE, HEAD_FILE, load_config, get_client_credential,
 )
 from mut.foundation.error import DirtyWorkdirError
 from mut.foundation.fs import read_text, write_text, mkdir_p
@@ -49,8 +49,8 @@ def pull(repo: MutRepo, force: bool = False) -> dict:
 
     push_result = _auto_push_if_needed(repo)
 
-    credential = read_text(repo.mut_root / CREDENTIAL_FILE)
-    client = MutClient(server_url, credential)
+    credential, user_identity = get_client_credential(repo.mut_root, repo.workdir)
+    client = MutClient(server_url, credential, user_identity=user_identity)
 
     remote_head_path = repo.mut_root / REMOTE_HEAD_FILE
     since_version = (int(read_text(remote_head_path))

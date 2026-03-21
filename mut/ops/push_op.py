@@ -9,7 +9,7 @@
 from __future__ import annotations
 
 from mut.ops.repo import MutRepo
-from mut.foundation.config import REMOTE_HEAD_FILE, CREDENTIAL_FILE, load_config
+from mut.foundation.config import REMOTE_HEAD_FILE, load_config, get_client_credential
 from mut.foundation.fs import read_text, write_text
 from mut.foundation.transport import MutClient
 from mut.core import manifest as manifest_mod
@@ -26,8 +26,8 @@ def push(repo: MutRepo) -> dict:
     if not server_url:
         return _local_push(repo)
 
-    credential = read_text(repo.mut_root / CREDENTIAL_FILE)
-    client = MutClient(server_url, credential)
+    credential, user_identity = get_client_credential(repo.mut_root, repo.workdir)
+    client = MutClient(server_url, credential, user_identity=user_identity)
 
     unpushed = repo.snapshots.get_unpushed()
     if not unpushed:

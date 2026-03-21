@@ -88,7 +88,7 @@ for i in $(seq 1 5); do
     CREDS[$i]=$($MUT_SERVER issue-credential "$SERVER_DIR" --scope "scope-$i" --agent "agent-$i" --mode rw)
 done
 
-$MUT_SERVER serve "$SERVER_DIR" --port $PORT &
+$MUT_SERVER serve "$SERVER_DIR" --port $PORT --auth api_key &
 SERVER_PID=$!
 sleep 1
 echo "  Server running on port $PORT with 5 agents"

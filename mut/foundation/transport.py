@@ -20,7 +20,6 @@ from typing import Optional
 
 from mut.foundation.error import NetworkError
 from mut.core.protocol import (
-    PROTOCOL_VERSION,
     PushRequest, PullRequest, NegotiateRequest, CloneRequest,
 )
 
@@ -62,11 +61,14 @@ def _is_retryable(e: Exception) -> bool:
 
 def _make_request(url: str, data: dict | None = None,
                   credential: str | None = None, method: str | None = None,
-                  timeout: int = _DEFAULT_TIMEOUT) -> dict:
+                  timeout: int = _DEFAULT_TIMEOUT,
+                  user_identity: str | None = None) -> dict:
     """Send an HTTP request with retry on transient failures."""
     headers: dict[str, str] = {"Content-Type": "application/json"}
     if credential:
         headers["Authorization"] = f"Bearer {credential}"
+    if user_identity:
+        headers["X-Mut-User"] = user_identity
 
     body = json.dumps(data).encode() if data is not None else None
     if method is None:
@@ -99,17 +101,25 @@ class MutClient:
 
     Credential is an opaque string — the server's auth layer
     decides how to interpret it (API key, token, scope ID, etc.).
+    user_identity is sent as X-Mut-User header for identity binding.
     """
 
-    def __init__(self, server_url: str, credential: str):
+    def __init__(self, server_url: str, credential: str,
+                 user_identity: str = ""):
         self.server_url = server_url.rstrip("/")
         self.credential = credential
+        self.user_identity = user_identity
 
     def _post(self, endpoint: str, data: dict) -> dict:
         return _make_request(
             f"{self.server_url}{endpoint}", data=data,
             credential=self.credential,
+            user_identity=self.user_identity or None,
         )
+
+    def post(self, endpoint: str, data: dict) -> dict:
+        """Public post method for custom endpoints (e.g. /rollback)."""
+        return self._post(endpoint, data)
 
     def clone(self) -> dict:
         return self._post("/clone", CloneRequest().to_dict())
@@ -136,18 +146,31 @@ class MutClient:
         )
         return self._post("/pull", req.to_dict())
 
+    def pull_version(self, version: int) -> dict:
+        from mut.core.protocol import PullVersionRequest
+        req = PullVersionRequest(version=version)
+        return self._post("/pull-version", req.to_dict())
+
+    def rollback(self, target_version: int) -> dict:
+        from mut.core.protocol import RollbackRequest
+        req = RollbackRequest(target_version=target_version)
+        return self._post("/rollback", req.to_dict())
+
 
 class AsyncMutClient:
     """Async HTTP client for a single Mut server."""
 
-    def __init__(self, server_url: str, credential: str):
+    def __init__(self, server_url: str, credential: str,
+                 user_identity: str = ""):
         self.server_url = server_url.rstrip("/")
         self.credential = credential
+        self.user_identity = user_identity
 
     async def _post(self, endpoint: str, data: dict) -> dict:
         url = f"{self.server_url}{endpoint}"
         return await asyncio.to_thread(
             _make_request, url, data, self.credential,
+            None, _DEFAULT_TIMEOUT, self.user_identity or None,
         )
 
     async def clone(self) -> dict:

@@ -211,6 +211,66 @@ class NegotiateResponse:
         }
 
 
+# ── Pull Version ──────────────────────────────
+
+@dataclass
+class PullVersionRequest:
+    version: int = 0
+    protocol_version: int = PROTOCOL_VERSION
+
+    @classmethod
+    def from_dict(cls, d: dict) -> PullVersionRequest:
+        return cls(
+            version=d.get("version", 0),
+            protocol_version=d.get("protocol_version", 1),
+        )
+
+    def to_dict(self) -> dict:
+        return {
+            "protocol_version": self.protocol_version,
+            "version": self.version,
+        }
+
+
+# ── Rollback ──────────────────────────────────
+
+@dataclass
+class RollbackRequest:
+    target_version: int = 0
+    protocol_version: int = PROTOCOL_VERSION
+
+    @classmethod
+    def from_dict(cls, d: dict) -> RollbackRequest:
+        return cls(
+            target_version=d.get("target_version", 0),
+            protocol_version=d.get("protocol_version", 1),
+        )
+
+    def to_dict(self) -> dict:
+        return {
+            "protocol_version": self.protocol_version,
+            "target_version": self.target_version,
+        }
+
+
+@dataclass
+class RollbackResponse:
+    status: str
+    new_version: int = 0
+    target_version: int = 0
+    changes: list[dict] = field(default_factory=list)
+    protocol_version: int = PROTOCOL_VERSION
+
+    def to_dict(self) -> dict:
+        return {
+            "protocol_version": self.protocol_version,
+            "status": self.status,
+            "new_version": self.new_version,
+            "target_version": self.target_version,
+            "changes": self.changes,
+        }
+
+
 # ── Error ──────────────────────────────────────
 
 @dataclass

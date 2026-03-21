@@ -22,7 +22,7 @@ echo ""
 echo "▸ mut init"
 $MUT init
 
-# ── 创建文件（模拟 Agent A 的工作区）─────────
+# ── Create files (simulate Agent A workspace) ─
 mkdir -p src docs
 echo '{"name": "my-project", "version": "1.0"}' > config.json
 echo 'def main():
@@ -54,7 +54,7 @@ echo ""
 echo "▸ mut status (should be clean)"
 $MUT status
 
-# ── Agent A 修改一个文件 ──────────────────────
+# ── Agent A modifies a file ───────────────────
 echo '{"name": "my-project", "version": "1.1", "description": "Mut demo"}' > config.json
 
 echo ""
@@ -66,7 +66,7 @@ echo ""
 echo "▸ mut commit (Agent A: bump version)"
 $MUT commit -m "Bump version to 1.1" -w agent-A
 
-# ── Agent B 添加新文件 + 修改文件 ─────────────
+# ── Agent B adds new file + modifies file ─────
 echo '# Contributing Guide
 1. Fork the repo
 2. Make changes
@@ -91,14 +91,14 @@ echo ""
 echo "▸ mut commit (Agent B: add docs + update main)"
 $MUT commit -m "Add contributing guide and update main" -w agent-B
 
-# ── Agent C 删除一个文件 ──────────────────────
+# ── Agent C deletes a file ────────────────────
 rm docs/api.md
 
 echo ""
 echo "▸ mut commit (Agent C: remove old api docs)"
 $MUT commit -m "Remove deprecated api docs" -w agent-C
 
-# ── 完整 log ──────────────────────────────────
+# ── Full log ──────────────────────────────────
 echo ""
 echo "▸ mut log (full history)"
 $MUT log
@@ -108,7 +108,7 @@ echo ""
 echo "▸ mut diff 1 4 (all changes from start to now)"
 $MUT diff 1 4
 
-# ── show 文件内容 ─────────────────────────────
+# ── Show file content ─────────────────────────
 echo ""
 echo "▸ mut show 1:src/main.py (original version)"
 $MUT show 1:src/main.py
@@ -117,7 +117,7 @@ echo ""
 echo "▸ mut show 3:src/main.py (after Agent B's edit)"
 $MUT show 3:src/main.py
 
-# ── tree 对比 ─────────────────────────────────
+# ── Tree comparison ───────────────────────────
 echo ""
 echo "▸ mut tree 4 (current)"
 $MUT tree 4
@@ -136,7 +136,7 @@ echo ""
 echo "▸ mut pull (stub — nothing to pull)"
 $MUT pull
 
-# ── checkout 回到 v1 ──────────────────────────
+# ── Checkout back to v1 ───────────────────────
 echo ""
 echo "▸ mut checkout 1 (rollback to initial)"
 $MUT checkout 1
@@ -145,7 +145,7 @@ echo ""
 echo "▸ verify config.json is back to v1:"
 cat config.json
 
-# ── checkout 回到最新 ─────────────────────────
+# ── Checkout back to latest ───────────────────
 echo ""
 echo "▸ mut checkout 4 (back to latest)"
 $MUT checkout 4

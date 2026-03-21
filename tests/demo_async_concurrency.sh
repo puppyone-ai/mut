@@ -96,7 +96,7 @@ for i in $(seq 1 20); do
     ISO_CREDS[$i]=$($MUT_SERVER issue-credential "$SERVER_DIR" --scope "iso-$i" --agent "iso-$i" --mode rw)
 done
 
-$MUT_SERVER serve "$SERVER_DIR" --port $PORT &
+$MUT_SERVER serve "$SERVER_DIR" --port $PORT --auth api_key &
 SERVER_PID=$!
 sleep 1
 echo "  Async server running on port $PORT"
@@ -934,10 +934,11 @@ echo "  PART 22: Object store integrity"
 echo "══════════════════════════════════════════════════"
 
 STORE_TEST=$(python3 -c "
-import sys, tempfile, os; sys.path.insert(0, '/opt/mut')
+import sys, tempfile; sys.path.insert(0, '/opt/mut')
+from pathlib import Path
 from mut.core.object_store import ObjectStore
 with tempfile.TemporaryDirectory() as td:
-    store = ObjectStore(os.path.join(td, 'objects'))
+    store = ObjectStore(Path(td) / 'objects')
     h = store.put(b'hello world')
     assert store.exists(h)
     assert store.get(h) == b'hello world'
