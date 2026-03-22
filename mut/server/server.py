@@ -31,7 +31,7 @@ from mut.foundation.error import (
 )
 from mut.server.auth.base import Authenticator
 from mut.server.repo import ServerRepo
-from mut.server.graft import async_graft_subtree
+from mut.server.history import HistoryManager
 from mut.server.notification import NotificationManager
 from mut.server.websocket import (
     WebSocketManager, WebSocketClient, do_ws_handshake, _read_ws_frame,
@@ -159,6 +159,12 @@ async def _handle_push(repo: ServerRepo, auth: dict, body: dict) -> dict:
 
 async def _push_locked(repo: ServerRepo, scope: dict, auth: dict,
                        body: dict) -> dict:
+    """Core push logic — runs under scope queue (no global lock needed).
+
+    Per-scope versioning: each scope has its own version counter and
+    tree hash. The global version is a simple counter for cross-scope
+    ordering. No graft, no global root hash.
+    """
     objects_b64 = body.get("objects", {})
     snapshots = body.get("snapshots", [])
     base_version = body.get("base_version", 0)
@@ -203,35 +209,38 @@ async def _push_locked(repo: ServerRepo, scope: dict, auth: dict,
 
     await _async_apply_merged_files(repo, scope, our_files, merged_files)
 
-    new_scope_tree_hash = await repo.async_build_scope_tree(scope)
+    # Build new scope tree hash (no graft needed — scope-level only)
+    new_scope_hash = await repo.async_build_scope_tree(scope)
 
-    async with repo._ensure_global_lock():
-        current_version = await repo.async_get_latest_version()
-        old_root = await repo.async_get_root_hash()
+    # Update scope-level version (independent per scope)
+    scope_ver = await repo.async_get_scope_version(scope["path"])
+    new_scope_ver = scope_ver + 1
+    scope_version_id = HistoryManager.make_scope_version_id(
+        scope["path"], new_scope_ver,
+    )
 
-        if old_root and await repo.store.async_exists(old_root):
-            new_root = await async_graft_subtree(
-                repo.store, old_root, scope_prefix, new_scope_tree_hash,
-            )
-        else:
-            new_root = await repo.async_build_full_tree()
+    # Atomic global version increment (synchronous, no await between
+    # read+write, safe within asyncio even with parallel sibling scopes)
+    new_version = repo.next_global_version()
+    changes = _compute_changeset(scope_prefix, our_files, merged_files)
 
-        new_version = current_version + 1
-        changes = _compute_changeset(scope_prefix, our_files, merged_files)
-
-        await repo.async_record_history(
-            new_version, auth["agent"], snapshots[-1].get("message", ""),
-            scope["path"], changes,
-            conflicts=merge_conflicts, root_hash=new_root,
-        )
-        await repo.async_set_latest_version(new_version)
-        await repo.async_set_root_hash(new_root)
+    await repo.async_record_history(
+        new_version, auth["agent"], snapshots[-1].get("message", ""),
+        scope["path"], changes,
+        conflicts=merge_conflicts,
+        scope_hash=new_scope_hash,
+        scope_version=scope_version_id,
+    )
+    # Version already persisted by next_global_version()
+    await repo.history.async_set_scope_version(scope["path"], new_scope_ver)
+    await repo.history.async_set_scope_hash(scope["path"], new_scope_hash)
 
     await repo.async_record_audit("push", auth["agent"], {
         "scope": scope["path"],
         "snapshots": len(snapshots),
         "version": new_version,
-        "root": new_root,
+        "scope_version": scope_version_id,
+        "scope_hash": new_scope_hash,
         "merged": bool(merge_conflicts),
         "conflict_count": len(merge_conflicts),
     })
@@ -239,8 +248,9 @@ async def _push_locked(repo: ServerRepo, scope: dict, auth: dict,
     result = {
         "status": "ok",
         "version": new_version,
+        "scope_version": scope_version_id,
         "pushed": len(snapshots),
-        "root": new_root,
+        "scope_hash": new_scope_hash,
     }
     if merge_conflicts:
         result["merged"] = True
@@ -524,22 +534,40 @@ def _navigate_tree(store, tree_hash: str, parts: list) -> str | None:
 
 
 def _get_base_files(repo, scope, base_version) -> dict:
+    """Get scope files at a historical version for three-way merge base.
+
+    Uses scope_hash from the history entry directly (no global root
+    tree navigation needed). Falls back to legacy root hash for
+    backwards compatibility with pre-scope-hash history entries.
+    """
     entry = repo.get_history_entry(base_version)
-    if entry and entry.get("root") and repo.store.exists(entry["root"]):
-        scope_prefix = normalize_path(scope["path"])
-        try:
+    if not entry:
+        return {}
+
+    try:
+        # Prefer scope_hash (new per-scope versioning)
+        scope_hash = entry.get("scope_hash", "")
+        if scope_hash and repo.store.exists(scope_hash):
+            flat_hashes = tree_mod.tree_to_flat(repo.store, scope_hash)
+            return {path: repo.store.get(h)
+                    for path, h in flat_hashes.items()}
+
+        # Fallback: legacy root hash + tree navigation
+        root = entry.get("root", "")
+        if root and repo.store.exists(root):
+            scope_prefix = normalize_path(scope["path"])
             parts = scope_prefix.split("/") if scope_prefix else []
-            subtree_hash = _navigate_tree(repo.store, entry["root"], parts)
+            subtree_hash = _navigate_tree(repo.store, root, parts)
             if subtree_hash:
                 flat_hashes = tree_mod.tree_to_flat(repo.store, subtree_hash)
                 return {path: repo.store.get(h)
                         for path, h in flat_hashes.items()}
-        except (KeyError, json.JSONDecodeError) as exc:
-            print(f"[mut-server] warning: failed to read base "
-                  f"v{base_version}: {exc}")
-        except ObjectNotFoundError as exc:
-            print(f"[mut-server] warning: missing object for base "
-                  f"v{base_version}: {exc}")
+    except (KeyError, json.JSONDecodeError) as exc:
+        print(f"[mut-server] warning: failed to read base "
+              f"v{base_version}: {exc}")
+    except ObjectNotFoundError as exc:
+        print(f"[mut-server] warning: missing object for base "
+              f"v{base_version}: {exc}")
     return {}
 
 
@@ -576,13 +604,10 @@ async def async_serve(repo_root: str, host: str = "127.0.0.1",
 
     repo._post_push_hook = _post_push_hook
 
-    if not repo.get_root_hash():
-        root = repo.build_full_tree()
-        repo.set_root_hash(root)
-        if repo.get_latest_version() == 0:
-            repo.record_history(
-                0, "server", "initial state", "/", [], root_hash=root,
-            )
+    if repo.get_latest_version() == 0:
+        repo.record_history(
+            0, "server", "initial state", "/", [],
+        )
 
     active_tasks: set[asyncio.Task] = set()
 
@@ -601,7 +626,6 @@ async def async_serve(repo_root: str, host: str = "127.0.0.1",
     print(f"  repo: {repo.root}")
     print(f"  auth: {auth_name}")
     print(f"  version: {repo.get_latest_version()}")
-    print(f"  root: {repo.get_root_hash()[:16]}")
 
     try:
         async with server:

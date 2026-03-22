@@ -232,12 +232,13 @@ class TestBugFixGlobalLock:
         assert len(versions) == 2
         assert server_repo.get_latest_version() == 2
 
-    def test_global_lock_lazy_init(self, server_repo):
-        """ServerRepo creates global lock lazily (Python 3.9 compat)."""
-        assert server_repo._global_lock is None
-        lock = server_repo._ensure_global_lock()
-        assert isinstance(lock, asyncio.Lock)
-        assert server_repo._global_lock is lock
+    def test_version_counter_atomic(self, server_repo):
+        """next_global_version() returns unique sequential values."""
+        v1 = server_repo.next_global_version()
+        v2 = server_repo.next_global_version()
+        assert v1 == 1
+        assert v2 == 2
+        assert server_repo.get_latest_version() == 2
 
 
 # ── Bug fix #3: lost_hash for recovery ───────
