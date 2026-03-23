@@ -58,13 +58,21 @@ class ServerRepo:
         self.audit = AuditLog(FileSystemAuditBackend(self.meta / SERVER_AUDIT_DIR))
         self.locks_dir = self.meta / SERVER_LOCKS_DIR
 
-        self._global_lock: asyncio.Lock | None = None
         self._scope_queue = ScopeQueue()
+        self._version_counter: int | None = None  # lazy-loaded in-memory counter
 
-    def _ensure_global_lock(self) -> asyncio.Lock:
-        if self._global_lock is None:
-            self._global_lock = asyncio.Lock()
-        return self._global_lock
+    def next_global_version(self) -> int:
+        """Atomically increment and return the next global version number.
+
+        Uses an in-memory counter (no await between read+write) so it's
+        safe within asyncio's single-threaded event loop even when
+        sibling scopes run in parallel.
+        """
+        if self._version_counter is None:
+            self._version_counter = self.history.get_latest_version()
+        self._version_counter += 1
+        self.history.set_latest_version(self._version_counter)
+        return self._version_counter
 
     # ── Init ──────────────────────────────────────
 
@@ -112,17 +120,33 @@ class ServerRepo:
     def set_latest_version(self, version: int):
         self.history.set_latest_version(version)
 
+    # Deprecated: use scope-level hash instead
     def get_root_hash(self) -> str:
         return self.history.get_root_hash()
 
     def set_root_hash(self, h: str):
         self.history.set_root_hash(h)
 
+    # Per-scope version + hash
+    def get_scope_version(self, scope_path: str) -> int:
+        return self.history.get_scope_version(scope_path)
+
+    def set_scope_version(self, scope_path: str, version: int):
+        self.history.set_scope_version(scope_path, version)
+
+    def get_scope_hash(self, scope_path: str) -> str:
+        return self.history.get_scope_hash(scope_path)
+
+    def set_scope_hash(self, scope_path: str, h: str):
+        self.history.set_scope_hash(scope_path, h)
+
     def record_history(self, version: int, who: str, message: str,
                        scope_path: str, changes: list,
-                       conflicts: list | None = None, root_hash: str = ""):
+                       conflicts: list | None = None,
+                       scope_hash: str = "", scope_version: str = "",
+                       root_hash: str = ""):
         self.history.record(version, who, message, scope_path, changes,
-                            conflicts, root_hash)
+                            conflicts, scope_hash, scope_version, root_hash)
 
     def get_history_since(self, since_version: int,
                           scope_path: str | None = None,
@@ -145,11 +169,20 @@ class ServerRepo:
     async def async_set_root_hash(self, h: str):
         await self.history.async_set_root_hash(h)
 
+    async def async_get_scope_version(self, scope_path: str) -> int:
+        return await self.history.async_get_scope_version(scope_path)
+
+    async def async_get_scope_hash(self, scope_path: str) -> str:
+        return await self.history.async_get_scope_hash(scope_path)
+
     async def async_record_history(self, version: int, who: str, message: str,
                                    scope_path: str, changes: list,
-                                   conflicts: list = None, root_hash: str = ""):
+                                   conflicts: list = None,
+                                   scope_hash: str = "", scope_version: str = "",
+                                   root_hash: str = ""):
         await self.history.async_record(version, who, message, scope_path,
-                                        changes, conflicts, root_hash)
+                                        changes, conflicts, scope_hash,
+                                        scope_version, root_hash)
 
     async def async_get_history_since(self, since_version: int,
                                       scope_path: str = None,

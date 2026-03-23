@@ -25,7 +25,7 @@ from mut.core import tree as tree_mod
 from mut.foundation.error import (
     PermissionDenied, LockError, ObjectNotFoundError,
 )
-from mut.server.graft import graft_subtree
+from mut.server.history import HistoryManager
 from mut.server.repo import ServerRepo
 
 
@@ -138,24 +138,36 @@ def _push_locked(repo: ServerRepo, scope: dict, auth: dict,
 
     _apply_merged_files(repo, scope, our_files, merged_files)
 
-    new_root = _graft_scope_tree(repo, scope, scope_prefix)
+    # Build new scope tree hash (no graft — scope-level only)
+    new_scope_hash = repo.build_scope_tree(scope)
 
-    new_version = current_version + 1
+    # Per-scope version
+    scope_ver = repo.get_scope_version(scope["path"])
+    new_scope_ver = scope_ver + 1
+    scope_version_id = HistoryManager.make_scope_version_id(
+        scope["path"], new_scope_ver,
+    )
+
+    # Atomic global version increment
+    new_version = repo.next_global_version()
     changes = _compute_changeset(scope_prefix, our_files, merged_files)
 
     repo.record_history(
         new_version, auth["agent"], req.snapshots[-1].get("message", ""),
         scope["path"], changes,
-        conflicts=merge_conflicts, root_hash=new_root,
+        conflicts=merge_conflicts,
+        scope_hash=new_scope_hash,
+        scope_version=scope_version_id,
     )
-    repo.set_latest_version(new_version)
-    repo.set_root_hash(new_root)
+    repo.set_scope_version(scope["path"], new_scope_ver)
+    repo.set_scope_hash(scope["path"], new_scope_hash)
 
     repo.record_audit("push", auth["agent"], {
         "scope": scope["path"],
         "snapshots": len(req.snapshots),
         "version": new_version,
-        "root": new_root,
+        "scope_version": scope_version_id,
+        "scope_hash": new_scope_hash,
         "merged": bool(merge_conflicts),
         "conflict_count": len(merge_conflicts),
     })
@@ -164,7 +176,7 @@ def _push_locked(repo: ServerRepo, scope: dict, auth: dict,
         status="ok",
         version=new_version,
         pushed=len(req.snapshots),
-        root=new_root,
+        root=new_scope_hash,
         merged=bool(merge_conflicts),
         conflicts=len(merge_conflicts),
     ).to_dict()
@@ -221,6 +233,22 @@ def handle_pull(repo: ServerRepo, auth: dict, body: dict) -> dict:
 
 # ── Pull Version ──────────────────────────────
 
+def _resolve_scope_tree_hash(repo: ServerRepo, entry: dict,
+                             scope_path: str) -> str | None:
+    """Resolve the scope-level tree hash from a history entry.
+
+    Prefers scope_hash (new format), falls back to navigating root (legacy).
+    """
+    scope_hash = entry.get("scope_hash", "")
+    if scope_hash and repo.store.exists(scope_hash):
+        return scope_hash
+    root = entry.get("root", "")
+    if root and repo.store.exists(root):
+        parts = normalize_path(scope_path).split("/") if normalize_path(scope_path) else []
+        return _navigate_tree(repo.store, root, parts)
+    return None
+
+
 def handle_pull_version(repo: ServerRepo, auth: dict, body: dict) -> dict:
     """Pull files at a specific historical version (not just latest)."""
     scope = auth["_scope"]
@@ -234,23 +262,18 @@ def handle_pull_version(repo: ServerRepo, auth: dict, body: dict) -> dict:
         )
 
     entry = repo.get_history_entry(target_version)
-    if not entry or not entry.get("root"):
-        raise ValueError(f"version {target_version} has no root hash")
+    if not entry:
+        raise ValueError(f"version {target_version} not found")
 
-    target_root = entry["root"]
-    if not repo.store.exists(target_root):
+    subtree_hash = _resolve_scope_tree_hash(repo, entry, scope["path"])
+    if subtree_hash is None:
         raise ObjectNotFoundError(
-            f"root object for version {target_version} not found"
+            f"no tree data for version {target_version}"
         )
-
-    scope_prefix = normalize_path(scope["path"])
-    parts = scope_prefix.split("/") if scope_prefix else []
-    subtree_hash = _navigate_tree(repo.store, target_root, parts)
 
     files_b64 = {}
     objects_b64 = {}
     if subtree_hash:
-        from mut.core import tree as tree_mod
         flat = tree_mod.tree_to_flat(repo.store, subtree_hash)
         for path, h in flat.items():
             files_b64[path] = base64.b64encode(repo.store.get(h)).decode()
@@ -300,49 +323,50 @@ def handle_rollback(repo: ServerRepo, auth: dict, body: dict) -> dict:
         ).to_dict()
 
     target_entry = repo.get_history_entry(target_version)
-    if not target_entry or not target_entry.get("root"):
-        raise ValueError(f"version {target_version} has no root hash")
+    if not target_entry:
+        raise ValueError(f"version {target_version} not found")
 
-    target_root = target_entry["root"]
-    if not repo.store.exists(target_root):
+    # Resolve target files using scope_hash or legacy root
+    scope_prefix = normalize_path(scope["path"])
+    subtree_hash = _resolve_scope_tree_hash(repo, target_entry, scope["path"])
+
+    if subtree_hash is None:
         raise ObjectNotFoundError(
-            f"root object for version {target_version} not found"
+            f"no tree data for version {target_version}"
         )
 
-    # Compute changes between current and target for the audit trail
-    scope_prefix = normalize_path(scope["path"])
-    parts = scope_prefix.split("/") if scope_prefix else []
+    target_files = _flatten_tree_to_bytes(repo.store, subtree_hash)
 
     current_files = repo.list_scope_files(scope)
-
-    target_subtree = _navigate_tree(repo.store, target_root, parts)
-    target_files = {}
-    if target_subtree:
-        target_files = _flatten_tree_to_bytes(repo.store, target_subtree)
-
-    # Compute changeset
     changes = _compute_changeset(scope_prefix, current_files, target_files)
 
     # Apply target files to current/
     _apply_merged_files(repo, scope, current_files, target_files)
 
-    # Graft and update version
-    new_root = _graft_scope_tree(repo, scope, scope_prefix)
-    new_version = current_version + 1
+    # Build new scope hash and update versions
+    new_scope_hash = repo.build_scope_tree(scope)
+    scope_ver = repo.get_scope_version(scope["path"])
+    new_scope_ver = scope_ver + 1
+    scope_version_id = HistoryManager.make_scope_version_id(
+        scope["path"], new_scope_ver,
+    )
+    new_version = repo.next_global_version()
 
     repo.record_history(
         new_version, auth["agent"],
         f"rollback to v{target_version}",
         scope["path"], changes,
-        root_hash=new_root,
+        scope_hash=new_scope_hash,
+        scope_version=scope_version_id,
     )
-    repo.set_latest_version(new_version)
-    repo.set_root_hash(new_root)
+    repo.set_scope_version(scope["path"], new_scope_ver)
+    repo.set_scope_hash(scope["path"], new_scope_hash)
 
     repo.record_audit("rollback", auth["agent"], {
         "scope": scope["path"],
         "target_version": target_version,
         "new_version": new_version,
+        "scope_version": scope_version_id,
     })
 
     return RollbackResponse(
@@ -386,17 +410,6 @@ def _apply_merged_files(repo, scope, old_scope_files, merged_files):
     repo.write_scope_files(scope, merged_files)
 
 
-def _graft_scope_tree(repo, scope, scope_prefix):
-    new_scope_tree_hash = repo.build_scope_tree(scope)
-    old_root = repo.get_root_hash()
-
-    if old_root and repo.store.exists(old_root):
-        return graft_subtree(
-            repo.store, old_root, scope_prefix, new_scope_tree_hash,
-        )
-    return repo.build_full_tree()
-
-
 def _compute_changeset(scope_prefix, old_files, merged_files):
     changes = []
     for rel_path in merged_files:
@@ -430,18 +443,31 @@ def _navigate_tree(store, tree_hash, parts):
 
 
 def _get_base_files(repo, scope, base_version):
+    """Get scope files at a historical version for three-way merge base.
+
+    Uses scope_hash directly when available, falls back to legacy root hash.
+    """
     entry = repo.get_history_entry(base_version)
-    if entry and entry.get("root") and repo.store.exists(entry["root"]):
-        scope_prefix = normalize_path(scope["path"])
-        try:
+    if not entry:
+        return {}
+    try:
+        # Prefer scope_hash (new per-scope versioning)
+        scope_hash = entry.get("scope_hash", "")
+        if scope_hash and repo.store.exists(scope_hash):
+            return _flatten_tree_to_bytes(repo.store, scope_hash)
+
+        # Fallback: legacy root hash + tree navigation
+        root = entry.get("root", "")
+        if root and repo.store.exists(root):
+            scope_prefix = normalize_path(scope["path"])
             parts = scope_prefix.split("/") if scope_prefix else []
-            subtree_hash = _navigate_tree(repo.store, entry["root"], parts)
+            subtree_hash = _navigate_tree(repo.store, root, parts)
             if subtree_hash:
                 return _flatten_tree_to_bytes(repo.store, subtree_hash)
-        except (KeyError, json.JSONDecodeError) as exc:
-            print(f"[mut-server] warning: failed to read base "
-                  f"v{base_version}: {exc}")
-        except ObjectNotFoundError as exc:
-            print(f"[mut-server] warning: missing object for base "
-                  f"v{base_version}: {exc}")
+    except (KeyError, json.JSONDecodeError) as exc:
+        print(f"[mut-server] warning: failed to read base "
+              f"v{base_version}: {exc}")
+    except ObjectNotFoundError as exc:
+        print(f"[mut-server] warning: missing object for base "
+              f"v{base_version}: {exc}")
     return {}
