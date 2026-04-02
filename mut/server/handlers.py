@@ -412,10 +412,12 @@ def _apply_merged_files(repo, scope, old_scope_files, merged_files):
 
 def _compute_changeset(scope_prefix, old_files, merged_files):
     changes = []
-    for rel_path in merged_files:
+    for rel_path, new_data in merged_files.items():
         full = f"{scope_prefix}/{rel_path}" if scope_prefix else rel_path
-        action = "add" if rel_path not in old_files else "update"
-        changes.append({"path": full, "action": action})
+        if rel_path not in old_files:
+            changes.append({"path": full, "action": "add"})
+        elif old_files[rel_path] != new_data:
+            changes.append({"path": full, "action": "update"})
     for old_path in old_files:
         if old_path not in merged_files:
             full = (f"{scope_prefix}/{old_path}"
