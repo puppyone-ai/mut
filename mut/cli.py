@@ -64,8 +64,7 @@ def cmd_clone(args):
             print("  Pass --credential <key> to authenticate.", file=sys.stderr)
             sys.exit(1)
 
-    workdir = args.dir if args.dir else None
-    repo = clone_op.clone(url, credential, workdir)
+    repo = clone_op.clone(url, credential)
     print(f"Cloned into {repo.workdir}")
 
 
@@ -244,8 +243,6 @@ def main():
     p_clone.add_argument("url", help="Server URL, e.g. http://localhost:9742")
     p_clone.add_argument("--credential", default="",
                          help="Auth credential (API key, token, etc.)")
-    p_clone.add_argument("--dir", default="",
-                         help="Target directory (default: auto from project)")
 
     p_commit = sub.add_parser("commit", help="Snapshot the working directory")
     p_commit.add_argument("-m", "--message", required=True,
