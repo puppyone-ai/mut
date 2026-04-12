@@ -12,5 +12,12 @@ def hash_bytes(data: bytes) -> str:
 
 
 def hash_file(path: Path) -> str:
-    """Return truncated SHA-256 hex digest of a file's contents."""
-    return hash_bytes(path.read_bytes())
+    """Return truncated SHA-256 hex digest of a file's contents (streamed)."""
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        while True:
+            chunk = f.read(8192)
+            if not chunk:
+                break
+            h.update(chunk)
+    return h.hexdigest()[:HASH_LEN]

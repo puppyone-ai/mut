@@ -141,6 +141,9 @@ def _push_locked(repo: ServerRepo, scope: dict, auth: dict,
     # Build new scope tree hash (no graft — scope-level only)
     new_scope_hash = repo.build_scope_tree(scope)
 
+    # Compute the full root hash by grafting scope tree into global root
+    new_root_hash = _compute_root_hash(repo, scope["path"], new_scope_hash)
+
     # Per-scope version
     scope_ver = repo.get_scope_version(scope["path"])
     new_scope_ver = scope_ver + 1
@@ -158,9 +161,11 @@ def _push_locked(repo: ServerRepo, scope: dict, auth: dict,
         conflicts=merge_conflicts,
         scope_hash=new_scope_hash,
         scope_version=scope_version_id,
+        root_hash=new_root_hash,
     )
     repo.set_scope_version(scope["path"], new_scope_ver)
     repo.set_scope_hash(scope["path"], new_scope_hash)
+    repo.set_root_hash(new_root_hash)
 
     repo.record_audit("push", auth["agent"], {
         "scope": scope["path"],
@@ -345,6 +350,8 @@ def handle_rollback(repo: ServerRepo, auth: dict, body: dict) -> dict:
 
     # Build new scope hash and update versions
     new_scope_hash = repo.build_scope_tree(scope)
+    new_root_hash = _compute_root_hash(repo, scope["path"], new_scope_hash)
+
     scope_ver = repo.get_scope_version(scope["path"])
     new_scope_ver = scope_ver + 1
     scope_version_id = HistoryManager.make_scope_version_id(
@@ -358,9 +365,11 @@ def handle_rollback(repo: ServerRepo, auth: dict, body: dict) -> dict:
         scope["path"], changes,
         scope_hash=new_scope_hash,
         scope_version=scope_version_id,
+        root_hash=new_root_hash,
     )
     repo.set_scope_version(scope["path"], new_scope_ver)
     repo.set_scope_hash(scope["path"], new_scope_hash)
+    repo.set_root_hash(new_root_hash)
 
     repo.record_audit("rollback", auth["agent"], {
         "scope": scope["path"],
@@ -378,6 +387,26 @@ def handle_rollback(repo: ServerRepo, auth: dict, body: dict) -> dict:
 
 
 # ── Shared helpers ─────────────────────────────
+
+def _compute_root_hash(repo: ServerRepo, scope_path: str,
+                       new_scope_hash: str) -> str:
+    """Compute the full project root hash after a scope push.
+
+    For root scope (path=""), the scope hash IS the root hash.
+    For sub-scopes, grafts the new scope tree into the existing global root.
+    """
+    from mut.server.graft import graft_subtree
+
+    norm = normalize_path(scope_path)
+    if not norm:
+        return new_scope_hash
+
+    old_root = repo.get_root_hash() or ""
+    if not old_root:
+        old_root = repo.store.put(json.dumps({}, sort_keys=True).encode())
+
+    return graft_subtree(repo.store, old_root, norm, new_scope_hash)
+
 
 def _store_incoming_objects(store: ObjectStore, objects_b64: dict) -> None:
     for h, b64data in objects_b64.items():

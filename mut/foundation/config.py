@@ -1,6 +1,9 @@
 """Mut directory and configuration constants + unified config I/O."""
 
 import json
+import os
+import sys
+import warnings
 from pathlib import Path
 
 # ── Agent-side (.mut/) ───────────────────────
@@ -32,7 +35,18 @@ BUILTIN_IGNORE = {
 }
 
 # SHA-256 truncated hex length: 16 hex chars = 64 bits.
+# TODO: HASH_LEN = 32 (128 bits) would be safer against collisions, but
+# changing it would break compatibility with PuppyOne server which also uses 16.
 HASH_LEN = 16
+
+
+def _secure_file(path: Path):
+    """Set file permissions to 0o600 (user-only read/write) on POSIX systems."""
+    if sys.platform != "win32":
+        try:
+            os.chmod(str(path), 0o600)
+        except OSError:
+            pass  # best-effort; may fail on some filesystems
 
 
 def normalize_path(path: str) -> str:
@@ -51,7 +65,9 @@ def load_config(mut_root: Path) -> dict:
 
 def save_config(mut_root: Path, cfg: dict):
     from mut.foundation.fs import write_json
-    write_json(mut_root / CONFIG_FILE, cfg)
+    cfg_path = mut_root / CONFIG_FILE
+    write_json(cfg_path, cfg)
+    _secure_file(cfg_path)
 
 
 def load_env(workdir: Path) -> dict:
@@ -85,9 +101,30 @@ def get_client_credential(mut_root: Path, workdir: Path) -> tuple[str, str]:
         cred_path = mut_root / CREDENTIAL_FILE
         if cred_path.exists():
             credential = read_text(cred_path).strip()
+            # Warn if credential file has overly permissive permissions
+            if sys.platform != "win32":
+                try:
+                    mode = os.stat(str(cred_path)).st_mode & 0o777
+                    if mode & 0o077:
+                        warnings.warn(
+                            f"credential file {cred_path} has permissions "
+                            f"{oct(mode)} — should be 0o600. "
+                            f"Run: chmod 600 {cred_path}",
+                            stacklevel=2,
+                        )
+                except OSError:
+                    pass
+            _secure_file(cred_path)
 
-    if not user_identity:
+    # Fallback: read credential from config.json
+    if not credential:
         cfg = load_config(mut_root)
-        user_identity = cfg.get("user_identity", "")
+        credential = cfg.get("credential", "")
+        if not user_identity:
+            user_identity = cfg.get("user_identity", "")
+    else:
+        if not user_identity:
+            cfg = load_config(mut_root)
+            user_identity = cfg.get("user_identity", "")
 
     return credential, user_identity
