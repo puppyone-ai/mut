@@ -91,7 +91,7 @@ You have two [OpenClaw](https://github.com/openclawx/openclaw) agents. Agent A h
 ### 1. Install
 
 ```bash
-pip install git+https://github.com/puppyone-ai/mut.git
+pip install mutai
 ```
 
 This installs both `mut` (client) and `mut-server` (server) commands.

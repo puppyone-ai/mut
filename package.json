@@ -1,6 +1,6 @@
 {
-  "name": "mut-vcs",
-  "version": "0.1.0",
+  "name": "mutai",
+  "version": "0.1.1",
   "description": "Managed Unified Tree — version management for AI agents",
   "keywords": ["git", "version-control", "ai-agents", "vcs", "mut"],
   "license": "MIT",

@@ -3,11 +3,32 @@ requires = ["setuptools>=68.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "mut"
-version = "0.1.0"
+name = "mutai"
+version = "0.1.1"
 description = "Managed Unified Tree — version management for AI agents"
 requires-python = ">=3.9"
-license = {text = "MIT"}
+license = "MIT"
+readme = "README.md"
+authors = [
+    {name = "PuppyOne", email = "hello@puppyone.ai"},
+]
+keywords = ["version-control", "ai-agents", "context-management", "multi-agent", "mut"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Version Control",
+]
+
+[project.urls]
+Homepage = "https://github.com/puppyone-ai/mut"
+Repository = "https://github.com/puppyone-ai/mut"
+Issues = "https://github.com/puppyone-ai/mut/issues"
 
 [project.scripts]
 mut = "mut.cli:main"
