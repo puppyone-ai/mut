@@ -33,10 +33,11 @@ class TestInit:
         assert (workdir / ".mut").is_dir()
         assert (workdir / ".mut" / "objects").is_dir()
 
-    def test_double_init_fails(self, workdir):
+    def test_double_init_is_idempotent(self, workdir):
         init_op.init(str(workdir))
-        with pytest.raises(FileExistsError):
-            init_op.init(str(workdir))
+        # Second init should succeed silently (idempotent)
+        repo = init_op.init(str(workdir))
+        assert isinstance(repo, MutRepo)
 
     def test_returns_repo(self, workdir):
         repo = init_op.init(str(workdir))

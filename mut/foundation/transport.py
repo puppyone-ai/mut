@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import os
 import time
 import urllib.request
 import urllib.error
@@ -24,10 +25,10 @@ from mut.core.protocol import (
 )
 
 
-_DEFAULT_TIMEOUT = 60
+_DEFAULT_TIMEOUT = int(os.environ.get("MUT_TIMEOUT", "60"))
 _MAX_RETRIES = 3
 _RETRY_BACKOFF = 1.0
-_RETRYABLE_CODES = {429, 502, 503, 504}
+_RETRYABLE_CODES = {408, 429, 500, 502, 503, 504}
 
 
 def _parse_http_error(e: urllib.error.HTTPError) -> str:
@@ -42,7 +43,10 @@ def _retry_delay(e: urllib.error.HTTPError | None, attempt: int) -> float:
     if isinstance(e, urllib.error.HTTPError):
         retry_after = e.headers.get("Retry-After")
         if retry_after:
-            return float(retry_after)
+            try:
+                return float(retry_after)
+            except (ValueError, TypeError):
+                pass  # non-numeric Retry-After (e.g. HTTP-date); fall through
     return _RETRY_BACKOFF * (2 ** attempt)
 
 

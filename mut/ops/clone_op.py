@@ -10,7 +10,7 @@ from pathlib import Path
 
 from mut.foundation.config import (
     MUT_DIR, OBJECTS_DIR, SNAPSHOTS_FILE,
-    HEAD_FILE, REMOTE_HEAD_FILE, CONFIG_FILE, CREDENTIAL_FILE,
+    HEAD_FILE, REMOTE_HEAD_FILE, CONFIG_FILE,
 )
 from mut.foundation.fs import write_json, write_text, mkdir_p, is_safe_path
 from mut.foundation.transport import MutClient
@@ -27,9 +27,7 @@ def clone(server_url: str, credential: str, workdir: str = None) -> MutRepo:
     files_b64 = resp["files"]
     objects_b64 = resp["objects"]
     version = resp["version"]
-    scope_info = resp["scope"]
     project_name = resp.get("project", "project")
-    agent_id = resp.get("agent_id", "anonymous")
 
     if workdir is None:
         workdir = project_name
@@ -54,17 +52,16 @@ def clone(server_url: str, credential: str, workdir: str = None) -> MutRepo:
         mkdir_p(obj_path.parent)
         obj_path.write_bytes(base64.b64decode(b64data))
 
+    from mut.ops.init_op import CONFIG_VERSION
     write_json(mut / CONFIG_FILE, {
+        "version": CONFIG_VERSION,
         "server": server_url,
-        "scope": scope_info["path"],
-        "project": project_name,
-        "agent_id": agent_id,
+        "credential": credential,
     })
-    write_text(mut / CREDENTIAL_FILE, credential)
 
+    # Also save to global credential store for reuse across repos
     from mut.foundation.credentials import save_credential
-    save_credential(server_url, agent_id, credential,
-                    project=project_name, scope=scope_info["path"])
+    save_credential(server_url, credential)
 
     repo = MutRepo(workdir)
 
