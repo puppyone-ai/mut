@@ -125,9 +125,9 @@ def graft_or_merge_subtree(
     from mut.core.merge import merge_file_sets
     from mut.core.tree import tree_to_flat
 
-    base_files = _safe_flatten(store, old_scope_hash)
-    current_files = _safe_flatten(store, current_subtree)
-    new_files = _safe_flatten(store, new_scope_hash)
+    base_files = _flatten_tree(store, old_scope_hash)
+    current_files = _flatten_tree(store, current_subtree)
+    new_files = _flatten_tree(store, new_scope_hash)
 
     merged_files, _ = merge_file_sets(base_files, current_files, new_files)
 
@@ -157,16 +157,17 @@ def _navigate_to_hash(store: ObjectStore, root_hash: str, scope_path: str) -> st
     return current
 
 
-def _safe_flatten(store: ObjectStore, tree_hash: str) -> dict[str, bytes]:
-    """Flatten a tree hash to {path: bytes}, returning empty dict on error."""
+def _flatten_tree(store: ObjectStore, tree_hash: str) -> dict[str, bytes]:
+    """Flatten a tree hash to {path: bytes}.
+
+    Raises on store errors so callers can retry or fail explicitly
+    instead of silently merging against an empty tree.
+    """
     if not tree_hash:
         return {}
-    try:
-        from mut.core.tree import tree_to_flat
-        flat = tree_to_flat(store, tree_hash)
-        return {path: store.get(h) for path, h in flat.items()}
-    except Exception:
-        return {}
+    from mut.core.tree import tree_to_flat
+    flat = tree_to_flat(store, tree_hash)
+    return {path: store.get(h) for path, h in flat.items()}
 
 
 def _build_tree_from_flat(store: ObjectStore, files: dict[str, bytes]) -> str:

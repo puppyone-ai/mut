@@ -309,6 +309,9 @@ def handle_rollback(repo: ServerRepo, auth: dict, body: dict) -> dict:
 
     The version chain continues forward — rollback creates a NEW version
     whose content equals the target historical version's snapshot.
+
+    Uses CAS (compare-and-swap) on scope_hash to prevent concurrent
+    rollbacks from silently overwriting each other — same safety as push.
     """
     scope = auth["_scope"]
     if scope.get("mode", "r") == "r":
@@ -334,7 +337,6 @@ def handle_rollback(repo: ServerRepo, auth: dict, body: dict) -> dict:
     if not target_entry:
         raise ValueError(f"version {target_version} not found")
 
-    # Resolve target files using scope_hash or legacy root
     scope_prefix = normalize_path(scope["path"])
     subtree_hash = _resolve_scope_tree_hash(repo, target_entry, scope["path"])
 
@@ -345,14 +347,40 @@ def handle_rollback(repo: ServerRepo, auth: dict, body: dict) -> dict:
 
     target_files = _flatten_tree_to_bytes(repo.store, subtree_hash)
 
+    for attempt in range(MAX_CAS_RETRIES + 1):
+        result = _rollback_cas_attempt(
+            repo, scope, auth, target_version, target_files,
+            scope_prefix, attempt,
+        )
+        if result is not None:
+            return result
+
+    repo.record_audit("rollback_error", auth["agent"], {
+        "scope": scope["path"],
+        "target_version": target_version,
+        "error": "CAS failed after max retries",
+    })
+    raise LockError(
+        f"concurrent rollback conflict after {MAX_CAS_RETRIES} retries, try again"
+    )
+
+
+def _rollback_cas_attempt(
+    repo: ServerRepo, scope: dict, auth: dict,
+    target_version: int, target_files: dict,
+    scope_prefix: str, attempt: int,
+) -> dict | None:
+    """Single CAS rollback attempt. Returns result dict on success, None on CAS failure."""
+    old_scope_hash = repo.get_scope_hash(scope["path"])
     current_files = repo.list_scope_files(scope)
     changes = _compute_changeset(scope_prefix, current_files, target_files)
 
-    # Apply target files to current/
     _apply_merged_files(repo, scope, current_files, target_files)
-
-    # Build new scope hash and update versions
     new_scope_hash = repo.build_scope_tree(scope)
+
+    if not repo.cas_update_scope(scope["path"], old_scope_hash, new_scope_hash):
+        return None
+
     scope_ver = repo.get_scope_version(scope["path"])
     new_scope_ver = scope_ver + 1
     scope_version_id = HistoryManager.make_scope_version_id(
@@ -368,19 +396,21 @@ def handle_rollback(repo: ServerRepo, auth: dict, body: dict) -> dict:
         scope_version=scope_version_id,
     )
     repo.set_scope_version(scope["path"], new_scope_ver)
-    repo.set_scope_hash(scope["path"], new_scope_hash)
 
     repo.record_audit("rollback", auth["agent"], {
         "scope": scope["path"],
         "target_version": target_version,
         "new_version": new_version,
         "scope_version": scope_version_id,
+        "scope_hash": new_scope_hash,
+        "cas_attempts": attempt + 1,
     })
 
     return RollbackResponse(
         status="rolled-back",
         new_version=new_version,
         target_version=target_version,
+        root=new_scope_hash,
         changes=changes,
     ).to_dict()
 

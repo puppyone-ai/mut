@@ -261,17 +261,21 @@ class RollbackResponse:
     status: str
     new_version: int = 0
     target_version: int = 0
+    root: str = ""
     changes: list[dict] = field(default_factory=list)
     protocol_version: int = PROTOCOL_VERSION
 
     def to_dict(self) -> dict:
-        return {
+        d: dict = {
             "protocol_version": self.protocol_version,
             "status": self.status,
             "new_version": self.new_version,
             "target_version": self.target_version,
             "changes": self.changes,
         }
+        if self.root:
+            d["root"] = self.root
+        return d
 
 
 # ── Error ──────────────────────────────────────
