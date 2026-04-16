@@ -116,6 +116,7 @@ class PushResponse:
     root: str = ""
     merged: bool = False
     conflicts: int = 0
+    merged_changes: list[dict] = field(default_factory=list)
     protocol_version: int = PROTOCOL_VERSION
 
     def to_dict(self) -> dict:
@@ -129,6 +130,8 @@ class PushResponse:
         if self.merged:
             d["merged"] = True
             d["conflicts"] = self.conflicts
+        if self.merged_changes:
+            d["merged_changes"] = self.merged_changes
         return d
 
 

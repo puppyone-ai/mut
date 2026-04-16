@@ -347,6 +347,18 @@ class ServerRepo:
     def release_lock(self, scope_id: str):
         lock_release(self.locks_dir / f"{scope_id}.lock")
 
+    def cas_update_scope(self, scope_path: str, old_hash: str, new_hash: str) -> bool:
+        """CAS update scope hash. Returns True if old_hash matched and update succeeded.
+        
+        Default implementation uses file-based scope state (suitable for single-process).
+        PuppyOne overrides this with a database CAS (UPDATE ... WHERE scope_hash = old_hash).
+        """
+        current = self.get_scope_hash(scope_path)
+        if current != old_hash:
+            return False
+        self.set_scope_hash(scope_path, new_hash)
+        return True
+
 
 def _scope_base(current: Path, scope_path: str) -> Path:
     return current / scope_path if scope_path else current

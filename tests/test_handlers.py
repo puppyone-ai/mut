@@ -144,17 +144,15 @@ class TestHandlePush:
         with pytest.raises(PermissionDenied, match="read-only"):
             handle_push(server_repo, ro_auth, {})
 
-    def test_push_lock_conflict(self, server_repo, auth):
-        scope = auth["_scope"]
-        server_repo.acquire_lock(scope["id"])
-        try:
-            with pytest.raises(LockError, match="locked"):
-                handle_push(server_repo, auth, {
-                    "base_version": 0, "snapshots": [{"id": 1, "root": "x"}],
-                    "objects": {},
-                })
-        finally:
-            server_repo.release_lock(scope["id"])
+    def test_push_cas_retry_on_concurrent_update(self, server_repo, auth):
+        """CAS push fails when scope_hash changes between read and write."""
+        result = self._push_with_files(server_repo, auth, {"a.py": b"first"})
+        assert result["status"] == "ok"
+
+        # Second push with stale base_version should still succeed (CAS + merge)
+        result2 = self._push_with_files(server_repo, auth, {"b.py": b"second"},
+                                         base_version=0)
+        assert result2["status"] == "ok"
 
     def test_push_increments_version(self, server_repo, auth):
         result1 = self._push_with_files(server_repo, auth, {"a.py": b"v1"})

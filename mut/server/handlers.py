@@ -72,31 +72,15 @@ def handle_clone(repo: ServerRepo, auth: dict, _body: dict) -> dict:
 
 # ── Push ───────────────────────────────────────
 
+MAX_CAS_RETRIES = 3
+
 def handle_push(repo: ServerRepo, auth: dict, body: dict) -> dict:
     scope = auth["_scope"]
 
     if scope.get("mode", "r") == "r":
         raise PermissionDenied("scope is read-only")
 
-    scope_id = scope["id"]
-    if not repo.acquire_lock(scope_id):
-        raise LockError("scope is locked by another push, retry later")
-
-    try:
-        return _push_locked(repo, scope, auth, body)
-    except Exception as exc:
-        repo.record_audit("push_error", auth["agent"], {
-            "scope": scope["path"], "error": str(exc),
-        })
-        raise
-    finally:
-        repo.release_lock(scope_id)
-
-
-def _push_locked(repo: ServerRepo, scope: dict, auth: dict,
-                 body: dict) -> dict:
     req = PushRequest.from_dict(body)
-
     _store_incoming_objects(repo.store, req.objects)
 
     if not req.snapshots:
@@ -115,6 +99,25 @@ def _push_locked(repo: ServerRepo, scope: dict, auth: dict,
         })
         raise PermissionDenied(f"paths outside scope: {rejected[:5]}")
 
+    for attempt in range(MAX_CAS_RETRIES + 1):
+        result = _push_cas_attempt(
+            repo, scope, auth, req, their_files, scope_prefix, attempt,
+        )
+        if result is not None:
+            return result
+
+    repo.record_audit("push_error", auth["agent"], {
+        "scope": scope["path"], "error": "CAS failed after max retries",
+    })
+    raise LockError(f"concurrent push conflict after {MAX_CAS_RETRIES} retries, try again")
+
+
+def _push_cas_attempt(
+    repo: ServerRepo, scope: dict, auth: dict, req: PushRequest,
+    their_files: dict, scope_prefix: str, attempt: int,
+) -> dict | None:
+    """Single CAS push attempt. Returns result dict on success, None on CAS failure."""
+    old_scope_hash = repo.get_scope_hash(scope["path"])
     our_files = repo.list_scope_files(scope)
     current_version = repo.get_latest_version()
 
@@ -128,6 +131,7 @@ def _push_locked(repo: ServerRepo, scope: dict, auth: dict,
             "scope": scope["path"],
             "base_version": req.base_version,
             "server_version": current_version,
+            "attempt": attempt,
             "conflicts": [
                 {"path": c.path, "strategy": c.strategy,
                  "detail": c.detail, "kept": c.kept,
@@ -138,22 +142,22 @@ def _push_locked(repo: ServerRepo, scope: dict, auth: dict,
 
     _apply_merged_files(repo, scope, our_files, merged_files)
 
-    # Build new scope tree hash (no graft — scope-level only)
     new_scope_hash = repo.build_scope_tree(scope)
 
-    # Compute the full root hash by grafting scope tree into global root
-    new_root_hash = _compute_root_hash(repo, scope["path"], new_scope_hash)
+    # CAS: only succeeds if scope_hash hasn't changed since we read it
+    if not repo.cas_update_scope(scope["path"], old_scope_hash, new_scope_hash):
+        return None  # CAS failed, caller retries
 
-    # Per-scope version
+    # CAS succeeded — safe to commit version and history
     scope_ver = repo.get_scope_version(scope["path"])
     new_scope_ver = scope_ver + 1
     scope_version_id = HistoryManager.make_scope_version_id(
         scope["path"], new_scope_ver,
     )
 
-    # Atomic global version increment
     new_version = repo.next_global_version()
     changes = _compute_changeset(scope_prefix, our_files, merged_files)
+    merged_changes = _compute_merged_changes(our_files, merged_files, their_files, scope_prefix)
 
     repo.record_history(
         new_version, auth["agent"], req.snapshots[-1].get("message", ""),
@@ -161,11 +165,8 @@ def _push_locked(repo: ServerRepo, scope: dict, auth: dict,
         conflicts=merge_conflicts,
         scope_hash=new_scope_hash,
         scope_version=scope_version_id,
-        root_hash=new_root_hash,
     )
     repo.set_scope_version(scope["path"], new_scope_ver)
-    repo.set_scope_hash(scope["path"], new_scope_hash)
-    repo.set_root_hash(new_root_hash)
 
     repo.record_audit("push", auth["agent"], {
         "scope": scope["path"],
@@ -175,6 +176,7 @@ def _push_locked(repo: ServerRepo, scope: dict, auth: dict,
         "scope_hash": new_scope_hash,
         "merged": bool(merge_conflicts),
         "conflict_count": len(merge_conflicts),
+        "cas_attempts": attempt + 1,
     })
 
     return PushResponse(
@@ -184,6 +186,7 @@ def _push_locked(repo: ServerRepo, scope: dict, auth: dict,
         root=new_scope_hash,
         merged=bool(merge_conflicts),
         conflicts=len(merge_conflicts),
+        merged_changes=merged_changes,
     ).to_dict()
 
 
@@ -350,8 +353,6 @@ def handle_rollback(repo: ServerRepo, auth: dict, body: dict) -> dict:
 
     # Build new scope hash and update versions
     new_scope_hash = repo.build_scope_tree(scope)
-    new_root_hash = _compute_root_hash(repo, scope["path"], new_scope_hash)
-
     scope_ver = repo.get_scope_version(scope["path"])
     new_scope_ver = scope_ver + 1
     scope_version_id = HistoryManager.make_scope_version_id(
@@ -365,11 +366,9 @@ def handle_rollback(repo: ServerRepo, auth: dict, body: dict) -> dict:
         scope["path"], changes,
         scope_hash=new_scope_hash,
         scope_version=scope_version_id,
-        root_hash=new_root_hash,
     )
     repo.set_scope_version(scope["path"], new_scope_ver)
     repo.set_scope_hash(scope["path"], new_scope_hash)
-    repo.set_root_hash(new_root_hash)
 
     repo.record_audit("rollback", auth["agent"], {
         "scope": scope["path"],
@@ -387,26 +386,6 @@ def handle_rollback(repo: ServerRepo, auth: dict, body: dict) -> dict:
 
 
 # ── Shared helpers ─────────────────────────────
-
-def _compute_root_hash(repo: ServerRepo, scope_path: str,
-                       new_scope_hash: str) -> str:
-    """Compute the full project root hash after a scope push.
-
-    For root scope (path=""), the scope hash IS the root hash.
-    For sub-scopes, grafts the new scope tree into the existing global root.
-    """
-    from mut.server.graft import graft_subtree
-
-    norm = normalize_path(scope_path)
-    if not norm:
-        return new_scope_hash
-
-    old_root = repo.get_root_hash() or ""
-    if not old_root:
-        old_root = repo.store.put(json.dumps({}, sort_keys=True).encode())
-
-    return graft_subtree(repo.store, old_root, norm, new_scope_hash)
-
 
 def _store_incoming_objects(store: ObjectStore, objects_b64: dict) -> None:
     for h, b64data in objects_b64.items():
@@ -453,6 +432,23 @@ def _compute_changeset(scope_prefix, old_files, merged_files):
                     if scope_prefix else old_path)
             changes.append({"path": full, "action": "delete"})
     return changes
+
+
+def _compute_merged_changes(our_files, merged_files, their_files, scope_prefix):
+    """Compute files that were merged from server state but not in client's push.
+    
+    These are files the client needs to know about to keep its local state in sync.
+    """
+    merged_changes = []
+    for rel_path, content in merged_files.items():
+        if rel_path not in their_files and rel_path in our_files:
+            full = f"{scope_prefix}/{rel_path}" if scope_prefix else rel_path
+            merged_changes.append({"path": full, "action": "merged_from_server"})
+        elif rel_path in their_files and rel_path in our_files:
+            if content != their_files[rel_path] and content != our_files.get(rel_path):
+                full = f"{scope_prefix}/{rel_path}" if scope_prefix else rel_path
+                merged_changes.append({"path": full, "action": "content_merged"})
+    return merged_changes
 
 
 def _flatten_tree_to_bytes(store, tree_hash):
