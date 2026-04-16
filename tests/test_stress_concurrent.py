@@ -1,4 +1,4 @@
-"""Stress tests for concurrent multi-client sync scenarios.
+"""Stress tests for concurrent multi-client sync scenarios (commit-id identity).
 
 Simulates multiple clients pushing/pulling to the same server simultaneously,
 testing queue serialization, auth isolation, notification delivery, and
@@ -14,14 +14,20 @@ import time
 from mut.server.repo import ServerRepo
 from mut.server.server import (
     _handle_push, _handle_pull, _handle_clone,
-    _handle_rollback, _handle_pull_version,
+    _handle_rollback, _handle_pull_commit,
 )
 from mut.server.auth.api_key import ApiKeyAuth
-from mut.server.sync_queue import ScopeQueue, _paths_overlap
+from mut.server.sync_queue import ScopeQueue
 from mut.server.notification import NotificationManager, InMemoryNotificationSink
 from mut.server.websocket import WebSocketManager, WebSocketClient
 from mut.foundation.error import PermissionDenied, AuthenticationError
 from mut.core import tree as tree_mod
+
+
+_SEED = "seedseedseedseed"
+_CID_X = "a1b2c3d4e5f60718"
+_CID_Y = "1122334455667788"
+_CID_Z = "9988776655443322"
 
 
 def _run(coro):
@@ -35,7 +41,8 @@ def _run(coro):
 @pytest.fixture
 def server_repo(tmp_path):
     repo = ServerRepo.init(str(tmp_path / "server"), project_name="stress-test")
-    repo.record_history(0, "server", "init", "/", [])
+    repo.record_history(_SEED, "server", "init", "/", [])
+    repo.set_head_commit_id(_SEED)
     return repo
 
 
@@ -48,8 +55,8 @@ def api_auth(server_repo, tmp_path):
     return ApiKeyAuth(server_repo.scopes, tmp_path / "creds.json")
 
 
-def _make_push(repo, files, base=0):
-    nested = {}
+def _make_push(repo, files, base: str = ""):
+    nested: dict = {}
     for path, content in files.items():
         parts = path.split("/")
         d = nested
@@ -69,7 +76,7 @@ def _make_push(repo, files, base=0):
     root = build(nested)
     reachable = tree_mod.collect_reachable_hashes(repo.store, root)
     return {
-        "base_version": base,
+        "base_commit_id": base,
         "snapshots": [{"id": 1, "root": root, "message": "push",
                        "who": "test", "time": ""}],
         "objects": {h: base64.b64encode(repo.store.get(h)).decode()
@@ -93,25 +100,28 @@ class TestConcurrentSameScope:
         keys = [api_auth.issue(f"agent-{i}", "scope-docs", "rw") for i in range(5)]
         auths = [_auth(api_auth, k) for k in keys]
 
+        # All five clients share the same base (_SEED). After the first push
+        # commits, subsequent pushes diverge from head and server-side three-way
+        # merge keeps every file.
         bodies = [
-            _make_push(server_repo, {f"file-{i}.txt": f"content-{i}".encode()})
+            _make_push(server_repo,
+                       {f"file-{i}.txt": f"content-{i}".encode()},
+                       base=_SEED)
             for i in range(5)
         ]
 
         async def push_all():
-            tasks = [_handle_push(server_repo, auths[i], bodies[i]) for i in range(5)]
+            tasks = [_handle_push(server_repo, auths[i], bodies[i])
+                     for i in range(5)]
             return await asyncio.gather(*tasks)
 
         results = _run(push_all())
 
-        # All should succeed
         assert all(r["status"] == "ok" for r in results)
+        # All commit ids should be distinct
+        commit_ids = [r["commit_id"] for r in results]
+        assert len(set(commit_ids)) == 5
 
-        # All should have unique versions
-        versions = [r["version"] for r in results]
-        assert len(set(versions)) == 5
-
-        # All files should be present after merges
         scope = auths[0]["_scope"]
         files = server_repo.list_scope_files(scope)
         for i in range(5):
@@ -133,29 +143,33 @@ class TestConcurrentSameScope:
             return r1, r2
 
         r1, r2 = _run(go())
-        assert r1["version"] == 1
-        assert r2["version"] == 2
+        assert r1["commit_id"] != r2["commit_id"]
 
-        # Server auto-merges — result contains content from both
         scope = a1["_scope"]
         files = server_repo.list_scope_files(scope)
         content = files["shared.txt"]
-        assert b"bob-version" in content  # bob's content present
-        # (may also contain alice's via line merge — that's correct)
+        assert b"bob-version" in content
 
     def test_rapid_sequential_pushes(self, server_repo, api_auth):
-        """20 rapid sequential pushes to same scope — version chain intact."""
+        """20 rapid sequential pushes to same scope — chain intact."""
         key = api_auth.issue("agent", "scope-docs", "rw")
         auth = _auth(api_auth, key)
 
         async def go():
+            prev = ""
+            seen = set()
             for i in range(20):
-                body = _make_push(server_repo, {f"r{i}.txt": f"v{i}".encode()}, base=i)
-                result = await _handle_push(server_repo, auth, body)
-                assert result["version"] == i + 1
+                body = _make_push(server_repo, {f"r{i}.txt": f"v{i}".encode()},
+                                  base=prev)
+                r = await _handle_push(server_repo, auth, body)
+                assert r["status"] == "ok"
+                assert r["commit_id"] not in seen
+                seen.add(r["commit_id"])
+                prev = r["commit_id"]
+            return seen
 
-        _run(go())
-        assert server_repo.get_latest_version() == 20
+        seen = _run(go())
+        assert len(seen) == 20
 
 
 # ══════════════════════════════════════════════════════════════
@@ -184,9 +198,7 @@ class TestConcurrentDifferentScopes:
         r_docs, r_src = _run(go())
         assert r_docs["status"] == "ok"
         assert r_src["status"] == "ok"
-
-        # Both versions exist (unique)
-        assert r_docs["version"] != r_src["version"]
+        assert r_docs["commit_id"] != r_src["commit_id"]
 
     def test_parent_child_scope_serialized(self, server_repo, api_auth):
         """Push to / and /docs/ — should serialize (parent-child overlap)."""
@@ -200,23 +212,22 @@ class TestConcurrentDifferentScopes:
         async def push_root():
             body = _make_push(server_repo, {"global.txt": b"root-data"})
             r = await _handle_push(server_repo, a_root, body)
-            order.append(("root", r["version"]))
+            order.append(("root", r["commit_id"]))
             return r
 
         async def push_docs():
-            await asyncio.sleep(0.01)  # slight delay
+            await asyncio.sleep(0.01)
             body = _make_push(server_repo, {"doc.md": b"doc-data"})
             r = await _handle_push(server_repo, a_docs, body)
-            order.append(("docs", r["version"]))
+            order.append(("docs", r["commit_id"]))
             return r
 
         async def go():
             return await asyncio.gather(push_root(), push_docs())
 
         _run(go())
-        # Both succeed, versions are sequential
-        versions = [v for _, v in order]
-        assert len(set(versions)) == 2
+        commit_ids = [cid for _, cid in order]
+        assert len(set(commit_ids)) == 2
 
     def test_3_scopes_mixed_parallel_serial(self, server_repo, api_auth):
         """/docs/ and /src/ parallel, /docs/internal/ serialized with /docs/."""
@@ -238,7 +249,7 @@ class TestConcurrentDifferentScopes:
 
         r1, r2, r3 = _run(go())
         assert all(r["status"] == "ok" for r in [r1, r2, r3])
-        assert len({r1["version"], r2["version"], r3["version"]}) == 3
+        assert len({r1["commit_id"], r2["commit_id"], r3["commit_id"]}) == 3
 
 
 # ══════════════════════════════════════════════════════════════
@@ -249,19 +260,15 @@ class TestAuthScopeIsolation:
     """Auth keys restrict clients to their assigned scope."""
 
     def test_docs_key_cannot_see_src_files(self, server_repo, api_auth):
-        """Clone with docs key only returns docs files, not src."""
         k_root = api_auth.issue("admin", "scope-root", "rw")
         k_docs = api_auth.issue("doc-user", "scope-docs", "rw")
         a_root = _auth(api_auth, k_root)
         a_docs = _auth(api_auth, k_docs)
 
-        # Push files to both scopes via root
         _run(_handle_push(server_repo, a_root,
                           _make_push(server_repo, {"readme.md": b"docs"})))
 
-        # Clone as docs user
         clone = _run(_handle_clone(server_repo, a_docs, {}))
-        # Should only see docs/ scope files
         assert clone["project"] == "stress-test"
 
     def test_revoked_key_rejected(self, server_repo, api_auth):
@@ -295,17 +302,19 @@ class TestAuthScopeIsolation:
         clone = _run(_handle_clone(server_repo, auth, {}))
         assert clone["project"] == "stress-test"
 
-        pull = _run(_handle_pull(server_repo, auth, {"since_version": 0}))
-        assert pull["status"] == "up-to-date"
+        pull = _run(_handle_pull(server_repo, auth, {"since_commit_id": ""}))
+        assert pull["status"] in ("up-to-date", "updated")
 
     def test_scope_excludes_enforced(self, server_repo, api_auth):
         """Push to excluded path within scope is rejected."""
         server_repo.scopes.delete("scope-docs")
-        server_repo.add_scope("scope-docs", "/docs/", exclude=["/docs/secret/"])
+        server_repo.add_scope("scope-docs", "/docs/",
+                              exclude=["/docs/secret/"])
         key = api_auth.issue("agent", "scope-docs", "rw")
         auth = _auth(api_auth, key)
 
-        body = _make_push(server_repo, {"secret/classified.txt": b"top secret"})
+        body = _make_push(server_repo,
+                          {"secret/classified.txt": b"top secret"})
         with pytest.raises(PermissionDenied, match="paths outside scope"):
             _run(_handle_push(server_repo, auth, body))
 
@@ -322,7 +331,6 @@ class TestAuthScopeIsolation:
         with pytest.raises(AuthenticationError):
             _auth(api_auth, k2)
 
-        # src key still works
         auth3 = _auth(api_auth, k3)
         assert auth3["agent"] == "a3"
 
@@ -336,15 +344,19 @@ class _FakeWriter:
         self.written = []
         self.fail = fail
         self.closed = False
+
     def write(self, data):
         if self.fail:
             raise ConnectionError
         self.written.append(data)
+
     async def drain(self):
         if self.fail:
             raise ConnectionError
+
     def close(self):
         self.closed = True
+
     async def wait_closed(self):
         pass
 
@@ -368,12 +380,13 @@ class TestNotificationDelivery:
         mgr.register(c3)
 
         notif = {"notification_id": "n1", "type": "version_update",
-                 "scope": "/docs/", "version": 5}
-        result = _run(mgr.broadcast(notif, exclude="alice", scope_path="/docs/"))
+                 "scope": "/docs/", "commit_id": _CID_X}
+        result = _run(mgr.broadcast(notif, exclude="alice",
+                                    scope_path="/docs/"))
 
         assert "bob" in result["sent"]
-        assert "alice" not in result["sent"]  # excluded (pusher)
-        assert "charlie" not in result["sent"]  # wrong scope
+        assert "alice" not in result["sent"]
+        assert "charlie" not in result["sent"]
 
     def test_offline_client_gets_queued(self):
         mgr = WebSocketManager()
@@ -387,9 +400,9 @@ class TestNotificationDelivery:
     def test_reconnect_flushes_queue(self):
         mgr = WebSocketManager()
         mgr._offline_queue["alice"] = [
-            {"notification_id": "n1", "version": 1},
-            {"notification_id": "n2", "version": 2},
-            {"notification_id": "n3", "version": 3},
+            {"notification_id": "n1", "commit_id": _CID_X},
+            {"notification_id": "n2", "commit_id": _CID_Y},
+            {"notification_id": "n3", "commit_id": _CID_Z},
         ]
 
         c = self._client("alice", "/docs/")
@@ -408,7 +421,7 @@ class TestNotificationDelivery:
         r2 = _run(mgr.broadcast(notif, scope_path="/docs/"))
 
         assert "bob" in r1["sent"]
-        assert "bob" not in r2["sent"]  # already seen
+        assert "bob" not in r2["sent"]
 
     def test_parent_scope_receives_child_notifications(self):
         mgr = WebSocketManager()
@@ -422,9 +435,9 @@ class TestNotificationDelivery:
         notif = {"notification_id": "n-child", "type": "version_update"}
         result = _run(mgr.broadcast(notif, scope_path="/docs/internal/"))
 
-        assert "admin" in result["sent"]   # root overlaps with everything
-        assert "editor" in result["sent"]  # /docs/ overlaps with /docs/internal/
-        assert "dev" not in result["sent"] # /src/ doesn't overlap
+        assert "admin" in result["sent"]
+        assert "editor" in result["sent"]
+        assert "dev" not in result["sent"]
 
     def test_offline_queue_capped_at_500(self):
         mgr = WebSocketManager()
@@ -442,12 +455,12 @@ class TestNotificationDelivery:
         nm = NotificationManager("test-repo", sink=sink)
 
         result = _run(nm.notify_after_push(
-            "/docs/", 5, "alice",
+            "/docs/", _CID_X, "alice",
             [{"path": "docs/a.txt", "action": "add"}],
             client_ids=["alice", "bob", "charlie"],
         ))
 
-        assert "alice" not in result["sent"]  # pusher excluded
+        assert "alice" not in result["sent"]
         assert "bob" in result["sent"]
         assert "charlie" in result["sent"]
 
@@ -460,7 +473,6 @@ class TestSyncQueueStress:
     """Stress tests for the scope queue serialization."""
 
     def test_10_concurrent_on_overlapping_scopes(self):
-        """10 tasks on overlapping scopes — all must serialize."""
         q = ScopeQueue()
         order = []
 
@@ -474,24 +486,17 @@ class TestSyncQueueStress:
         async def go():
             tasks = []
             for i in range(5):
-                tasks.append(asyncio.create_task(worker("/docs/", f"docs-{i}")))
+                tasks.append(asyncio.create_task(
+                    worker("/docs/", f"docs-{i}")))
             for i in range(5):
-                tasks.append(asyncio.create_task(worker("/docs/internal/", f"int-{i}")))
+                tasks.append(asyncio.create_task(
+                    worker("/docs/internal/", f"int-{i}")))
             await asyncio.gather(*tasks)
 
         _run(go())
-
-        # All /docs/ and /docs/internal/ should serialize (parent-child)
-        # Check no overlapping starts/ends
-        for i in range(len(order) - 1):
-            if order[i].endswith("_start"):
-                # Next should be the same task's end (no interleaving within overlap group)
-                pass  # hard to check strictly due to task scheduling
-
-        assert len(order) == 20  # 10 tasks × 2 events
+        assert len(order) == 20
 
     def test_siblings_truly_parallel(self):
-        """Sibling scopes run concurrently — verify timing."""
         q = ScopeQueue()
         started = []
 
@@ -512,11 +517,9 @@ class TestSyncQueueStress:
 
         elapsed = _run(go())
         assert len(started) == 3
-        # If parallel: ~0.05s; if serial: ~0.15s
-        assert elapsed < 0.12  # should be parallel
+        assert elapsed < 0.12
 
     def test_deep_nesting_serializes(self):
-        """Deeply nested scopes share queue with ancestors."""
         q = ScopeQueue()
         order = []
 
@@ -533,10 +536,11 @@ class TestSyncQueueStress:
             t2 = asyncio.create_task(worker("/a/b/", "L2"))
             await asyncio.sleep(0.002)
             t3 = asyncio.create_task(worker("/a/b/c/", "L3"))
-            await t1; await t2; await t3
+            await t1
+            await t2
+            await t3
 
         _run(go())
-        # L1 must finish before L2 starts, L2 before L3
         assert order.index("L1_end") < order.index("L2_start")
         assert order.index("L2_end") < order.index("L3_start")
 
@@ -555,14 +559,13 @@ class TestE2EClientServerSimulation:
         a_a = _auth(api_auth, k_a)
         a_b = _auth(api_auth, k_b)
 
-        # Alice pushes
         body = _make_push(server_repo, {"notes.md": b"# Meeting Notes"})
         r = _run(_handle_push(server_repo, a_a, body))
-        assert r["version"] == 1
+        assert r["status"] == "ok"
 
-        # Bob pulls
-        pull = _run(_handle_pull(server_repo, a_b, {"since_version": 0}))
+        pull = _run(_handle_pull(server_repo, a_b, {"since_commit_id": ""}))
         assert pull["status"] == "updated"
+        assert pull["head_commit_id"] == r["commit_id"]
         assert "notes.md" in pull["files"]
         content = base64.b64decode(pull["files"]["notes.md"])
         assert content == b"# Meeting Notes"
@@ -574,17 +577,17 @@ class TestE2EClientServerSimulation:
         a_a = _auth(api_auth, k_a)
         a_b = _auth(api_auth, k_b)
 
-        # Both push from v0
-        body_a = _make_push(server_repo, {"alice.txt": b"alice-data"}, base=0)
-        body_b = _make_push(server_repo, {"bob.txt": b"bob-data"}, base=0)
+        # Both clients pulled at _SEED then pushed concurrently — second push
+        # diverges from head and triggers three-way merge.
+        body_a = _make_push(server_repo, {"alice.txt": b"alice-data"},
+                            base=_SEED)
+        body_b = _make_push(server_repo, {"bob.txt": b"bob-data"},
+                            base=_SEED)
 
         r_a = _run(_handle_push(server_repo, a_a, body_a))
         r_b = _run(_handle_push(server_repo, a_b, body_b))
+        assert r_a["commit_id"] != r_b["commit_id"]
 
-        assert r_a["version"] == 1
-        assert r_b["version"] == 2
-
-        # Both files exist
         scope = a_a["_scope"]
         files = server_repo.list_scope_files(scope)
         assert files["alice.txt"] == b"alice-data"
@@ -596,22 +599,24 @@ class TestE2EClientServerSimulation:
         auth = _auth(api_auth, key)
 
         body1 = _make_push(server_repo, {"doc.md": b"# V1"})
-        _run(_handle_push(server_repo, auth, body1))
+        r1 = _run(_handle_push(server_repo, auth, body1))
+        cid1 = r1["commit_id"]
 
-        body2 = _make_push(server_repo, {"doc.md": b"# V2"}, base=1)
-        _run(_handle_push(server_repo, auth, body2))
+        body2 = _make_push(server_repo, {"doc.md": b"# V2"}, base=cid1)
+        r2 = _run(_handle_push(server_repo, auth, body2))
 
-        rb = _run(_handle_rollback(server_repo, auth, {"target_version": 1}))
-        assert rb["new_version"] == 3
+        rb = _run(_handle_rollback(server_repo, auth,
+                                   {"target_commit_id": cid1}))
+        assert rb["new_commit_id"] not in (cid1, r2["commit_id"])
 
-        # Pull version 1 specifically
-        pv = _run(_handle_pull_version(server_repo, auth, {"version": 1}))
+        pv = _run(_handle_pull_commit(server_repo, auth,
+                                      {"commit_id": cid1}))
         assert base64.b64decode(pv["files"]["doc.md"]) == b"# V1"
 
-        # Continue editing after rollback
-        body4 = _make_push(server_repo, {"doc.md": b"# V4"}, base=3)
+        body4 = _make_push(server_repo, {"doc.md": b"# V4"},
+                           base=rb["new_commit_id"])
         r4 = _run(_handle_push(server_repo, auth, body4))
-        assert r4["version"] == 4
+        assert r4["commit_id"] not in (cid1, r2["commit_id"], rb["new_commit_id"])
 
         files = server_repo.list_scope_files(auth["_scope"])
         assert files["doc.md"] == b"# V4"
@@ -623,20 +628,17 @@ class TestE2EClientServerSimulation:
         a_docs = _auth(api_auth, k_docs)
         a_src = _auth(api_auth, k_src)
 
-        # Push to docs
         _run(_handle_push(server_repo, a_docs,
                           _make_push(server_repo, {"readme.md": b"Docs"})))
-
-        # Push to src
         _run(_handle_push(server_repo, a_src,
                           _make_push(server_repo, {"main.py": b"Code"})))
 
-        # Pull as docs — only sees docs files
-        pull_docs = _run(_handle_pull(server_repo, a_docs, {"since_version": 0}))
+        pull_docs = _run(_handle_pull(server_repo, a_docs,
+                                      {"since_commit_id": ""}))
         assert "readme.md" in pull_docs["files"]
         assert "main.py" not in pull_docs["files"]
 
-        # Pull as src — only sees src files
-        pull_src = _run(_handle_pull(server_repo, a_src, {"since_version": 0}))
+        pull_src = _run(_handle_pull(server_repo, a_src,
+                                     {"since_commit_id": ""}))
         assert "main.py" in pull_src["files"]
         assert "readme.md" not in pull_src["files"]

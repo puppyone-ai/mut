@@ -7,6 +7,11 @@ these models.
 
 Protocol version is embedded in every request so that server and
 client can negotiate compatibility.
+
+Commit identity model (since v1 + hash-id migration):
+- Commits are identified by a 16-hex-char commit_id (SHA256 truncated).
+- Hash payload: scope_path | scope_hash | created_at_iso | who.
+- Linear history only; no parent_commit_id on the wire yet.
 """
 
 from __future__ import annotations
@@ -14,13 +19,9 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 
-# ── Protocol version ───────────────────────────
 PROTOCOL_VERSION = 1
 
 
-# ── Helpers ────────────────────────────────────
-
-# Re-export from canonical location for backwards compatibility
 from mut.foundation.config import normalize_path  # noqa: F401
 
 
@@ -62,7 +63,7 @@ class CloneResponse:
     files: dict[str, str]       # {rel_path: base64_content}
     objects: dict[str, str]     # {hash: base64_content}
     history: list[dict]
-    version: int
+    head_commit_id: str
     scope: ScopeInfo
     agent_id: str = ""
     protocol_version: int = PROTOCOL_VERSION
@@ -75,7 +76,7 @@ class CloneResponse:
             "files": self.files,
             "objects": self.objects,
             "history": self.history,
-            "version": self.version,
+            "head_commit_id": self.head_commit_id,
             "scope": self.scope.to_dict(),
         }
         return d
@@ -85,7 +86,7 @@ class CloneResponse:
 
 @dataclass
 class PushRequest:
-    base_version: int = 0
+    base_commit_id: str = ""
     snapshots: list[dict] = field(default_factory=list)
     objects: dict[str, str] = field(default_factory=dict)  # {hash: base64}
     protocol_version: int = PROTOCOL_VERSION
@@ -93,7 +94,7 @@ class PushRequest:
     @classmethod
     def from_dict(cls, d: dict) -> PushRequest:
         return cls(
-            base_version=d.get("base_version", 0),
+            base_commit_id=d.get("base_commit_id", ""),
             snapshots=d.get("snapshots", []),
             objects=d.get("objects", {}),
             protocol_version=d.get("protocol_version", 1),
@@ -102,7 +103,7 @@ class PushRequest:
     def to_dict(self) -> dict:
         return {
             "protocol_version": self.protocol_version,
-            "base_version": self.base_version,
+            "base_commit_id": self.base_commit_id,
             "snapshots": self.snapshots,
             "objects": self.objects,
         }
@@ -111,7 +112,7 @@ class PushRequest:
 @dataclass
 class PushResponse:
     status: str
-    version: int
+    commit_id: str = ""
     pushed: int = 0
     root: str = ""
     merged: bool = False
@@ -123,7 +124,7 @@ class PushResponse:
         d: dict = {
             "protocol_version": self.protocol_version,
             "status": self.status,
-            "version": self.version,
+            "commit_id": self.commit_id,
             "pushed": self.pushed,
             "root": self.root,
         }
@@ -139,14 +140,14 @@ class PushResponse:
 
 @dataclass
 class PullRequest:
-    since_version: int = 0
+    since_commit_id: str = ""
     have_hashes: list[str] = field(default_factory=list)
     protocol_version: int = PROTOCOL_VERSION
 
     @classmethod
     def from_dict(cls, d: dict) -> PullRequest:
         return cls(
-            since_version=d.get("since_version", 0),
+            since_commit_id=d.get("since_commit_id", ""),
             have_hashes=d.get("have_hashes", []),
             protocol_version=d.get("protocol_version", 1),
         )
@@ -154,7 +155,7 @@ class PullRequest:
     def to_dict(self) -> dict:
         d: dict = {
             "protocol_version": self.protocol_version,
-            "since_version": self.since_version,
+            "since_commit_id": self.since_commit_id,
         }
         if self.have_hashes:
             d["have_hashes"] = self.have_hashes
@@ -164,7 +165,7 @@ class PullRequest:
 @dataclass
 class PullResponse:
     status: str
-    version: int
+    head_commit_id: str = ""
     files: dict[str, str] = field(default_factory=dict)
     objects: dict[str, str] = field(default_factory=dict)
     history: list[dict] = field(default_factory=list)
@@ -174,7 +175,7 @@ class PullResponse:
         return {
             "protocol_version": self.protocol_version,
             "status": self.status,
-            "version": self.version,
+            "head_commit_id": self.head_commit_id,
             "files": self.files,
             "objects": self.objects,
             "history": self.history,
@@ -214,24 +215,25 @@ class NegotiateResponse:
         }
 
 
-# ── Pull Version ──────────────────────────────
+# ── Pull Commit ───────────────────────────────
 
 @dataclass
-class PullVersionRequest:
-    version: int = 0
+class PullCommitRequest:
+    """Fetch files at a specific commit (not just HEAD)."""
+    commit_id: str = ""
     protocol_version: int = PROTOCOL_VERSION
 
     @classmethod
-    def from_dict(cls, d: dict) -> PullVersionRequest:
+    def from_dict(cls, d: dict) -> PullCommitRequest:
         return cls(
-            version=d.get("version", 0),
+            commit_id=d.get("commit_id", ""),
             protocol_version=d.get("protocol_version", 1),
         )
 
     def to_dict(self) -> dict:
         return {
             "protocol_version": self.protocol_version,
-            "version": self.version,
+            "commit_id": self.commit_id,
         }
 
 
@@ -239,28 +241,28 @@ class PullVersionRequest:
 
 @dataclass
 class RollbackRequest:
-    target_version: int = 0
+    target_commit_id: str = ""
     protocol_version: int = PROTOCOL_VERSION
 
     @classmethod
     def from_dict(cls, d: dict) -> RollbackRequest:
         return cls(
-            target_version=d.get("target_version", 0),
+            target_commit_id=d.get("target_commit_id", ""),
             protocol_version=d.get("protocol_version", 1),
         )
 
     def to_dict(self) -> dict:
         return {
             "protocol_version": self.protocol_version,
-            "target_version": self.target_version,
+            "target_commit_id": self.target_commit_id,
         }
 
 
 @dataclass
 class RollbackResponse:
     status: str
-    new_version: int = 0
-    target_version: int = 0
+    new_commit_id: str = ""
+    target_commit_id: str = ""
     root: str = ""
     changes: list[dict] = field(default_factory=list)
     protocol_version: int = PROTOCOL_VERSION
@@ -269,8 +271,8 @@ class RollbackResponse:
         d: dict = {
             "protocol_version": self.protocol_version,
             "status": self.status,
-            "new_version": self.new_version,
-            "target_version": self.target_version,
+            "new_commit_id": self.new_commit_id,
+            "target_commit_id": self.target_commit_id,
             "changes": self.changes,
         }
         if self.root:

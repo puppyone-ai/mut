@@ -19,33 +19,38 @@ def _run(coro):
 
 # ── NotificationManager ────────────────────────────────────────
 
+_CID_1 = "a1b2c3d4e5f60718"
+_CID_2 = "1122334455667788"
+
+
 class TestNotificationManager:
     def test_create_notification(self):
         mgr = NotificationManager("test-repo")
         notif = mgr.create_notification(
-            "/docs/", 5, "alice",
+            "/docs/", _CID_1, "alice",
             [{"path": "docs/README.md", "action": "update"}],
         )
         assert notif.repo == "test-repo"
         assert notif.scope == "/docs/"
-        assert notif.version == 5
+        assert notif.commit_id == _CID_1
         assert notif.pushed_by == "alice"
         assert "docs/README.md" in notif.changed_files
         assert notif.notification_id  # non-empty UUID
 
     def test_notification_to_dict(self):
         mgr = NotificationManager("test-repo")
-        notif = mgr.create_notification("/", 1, "bob", [])
+        notif = mgr.create_notification("/", _CID_1, "bob", [])
         d = notif.to_dict()
-        assert d["type"] == "version_update"
+        assert d["type"] == "commit_update"
         assert d["repo"] == "test-repo"
+        assert d["commit_id"] == _CID_1
 
     def test_notify_excludes_pusher(self):
         sink = InMemoryNotificationSink()
         mgr = NotificationManager("repo", sink=sink)
 
         result = _run(mgr.notify_after_push(
-            "/docs/", 1, "alice",
+            "/docs/", _CID_1, "alice",
             [{"path": "docs/a.txt", "action": "add"}],
             client_ids=["alice", "bob", "charlie"],
         ))
@@ -56,7 +61,8 @@ class TestNotificationManager:
 
     def test_notify_empty_client_list(self):
         mgr = NotificationManager("repo")
-        result = _run(mgr.notify_after_push("/", 1, "alice", [], client_ids=[]))
+        result = _run(mgr.notify_after_push("/", _CID_1, "alice", [],
+                                            client_ids=[]))
         assert result["sent"] == []
         assert result["queued"] == []
 
@@ -67,7 +73,7 @@ class TestInMemorySink:
     def test_send_and_retrieve(self):
         sink = InMemoryNotificationSink()
         notif = Notification(
-            notification_id="n1", repo="r", scope="/", version=1,
+            notification_id="n1", repo="r", scope="/", commit_id=_CID_1,
             pushed_by="a", changed_files=[], timestamp="t",
         )
         _run(sink.send("bob", notif))
@@ -82,7 +88,7 @@ class TestInMemorySink:
     def test_peek_does_not_clear(self):
         sink = InMemoryNotificationSink()
         notif = Notification(
-            notification_id="n2", repo="r", scope="/", version=2,
+            notification_id="n2", repo="r", scope="/", commit_id=_CID_2,
             pushed_by="a", changed_files=[], timestamp="t",
         )
         _run(sink.send("bob", notif))
@@ -96,7 +102,8 @@ class TestInMemorySink:
         sink = InMemoryNotificationSink()
         for i in range(5):
             notif = Notification(
-                notification_id=f"n{i}", repo="r", scope="/", version=i,
+                notification_id=f"n{i}", repo="r", scope="/",
+                commit_id=f"{i:016x}",
                 pushed_by="a", changed_files=[], timestamp="t",
             )
             _run(sink.send("bob", notif))
@@ -187,8 +194,8 @@ class TestWebSocketManager:
 
         # Simulate offline: queue notifications directly
         mgr._offline_queue["alice"] = [
-            {"notification_id": "n1", "version": 1},
-            {"notification_id": "n2", "version": 2},
+            {"notification_id": "n1", "commit_id": _CID_1},
+            {"notification_id": "n2", "commit_id": _CID_2},
         ]
 
         # Alice reconnects

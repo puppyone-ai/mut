@@ -43,8 +43,8 @@ def push(repo: MutRepo) -> dict:
         return {"status": "up-to-date", "pushed": 0}
 
     remote_head_path = repo.mut_root / REMOTE_HEAD_FILE
-    base_version = (int(read_text(remote_head_path))
-                    if remote_head_path.exists() else 0)
+    base_commit_id = (read_text(remote_head_path).strip()
+                      if remote_head_path.exists() else "")
 
     relevant_hashes: set[str] = set()
     for s in unpushed:
@@ -66,25 +66,27 @@ def push(repo: MutRepo) -> dict:
         for s in unpushed
     ]
 
-    resp = client.push(base_version, snap_data, objects)
+    resp = client.push(base_commit_id, snap_data, objects)
 
-    server_version = resp.get("version", base_version)
+    server_commit_id = resp.get("commit_id", base_commit_id)
     latest_id = unpushed[-1]["id"]
-    repo.snapshots.mark_pushed(latest_id)
+    repo.snapshots.mark_pushed(latest_id, server_commit_id=server_commit_id)
 
     merged = resp.get("merged", False)
-    others_pushed = server_version > base_version + 1
 
-    if merged or others_pushed:
-        write_text(remote_head_path, str(base_version))
+    # On fast-forward: server commit matches what we built locally — safe to
+    # advance REMOTE_HEAD. On server-side merge: our local tree is stale,
+    # so we keep REMOTE_HEAD at base and let the next pull reconcile.
+    if merged:
+        write_text(remote_head_path, base_commit_id)
     else:
-        write_text(remote_head_path, str(server_version))
+        write_text(remote_head_path, server_commit_id)
 
     result: dict = {
         "status": "pushed",
         "pushed": len(unpushed),
         "latest_id": latest_id,
-        "server_version": server_version,
+        "server_commit_id": server_commit_id,
     }
     if merged:
         result["merged"] = True
@@ -99,7 +101,8 @@ def _local_push(repo: MutRepo) -> dict:
 
     latest = unpushed[-1]
     repo.snapshots.mark_pushed(latest["id"])
-    write_text(repo.mut_root / REMOTE_HEAD_FILE, str(latest["id"]))
+    # Local-only mode: no server commit_id exists; clear REMOTE_HEAD.
+    write_text(repo.mut_root / REMOTE_HEAD_FILE, "")
 
     return {
         "status": "pushed",

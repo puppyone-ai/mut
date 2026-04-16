@@ -128,10 +128,10 @@ class MutClient:
     def clone(self) -> dict:
         return self._post("/clone", CloneRequest().to_dict())
 
-    def push(self, base_version: int, snapshots: list,
+    def push(self, base_commit_id: str, snapshots: list,
              objects: dict[str, bytes]) -> dict:
         req = PushRequest(
-            base_version=base_version,
+            base_commit_id=base_commit_id,
             snapshots=snapshots,
             objects={h: base64.b64encode(data).decode()
                      for h, data in objects.items()},
@@ -142,22 +142,25 @@ class MutClient:
         req = NegotiateRequest(hashes=hashes)
         return self._post("/negotiate", req.to_dict())
 
-    def pull(self, since_version: int,
+    def pull(self, since_commit_id: str,
              have_hashes: Optional[list[str]] = None) -> dict:
         req = PullRequest(
-            since_version=since_version,
+            since_commit_id=since_commit_id,
             have_hashes=have_hashes or [],
         )
         return self._post("/pull", req.to_dict())
 
-    def pull_version(self, version: int) -> dict:
-        from mut.core.protocol import PullVersionRequest
-        req = PullVersionRequest(version=version)
-        return self._post("/pull-version", req.to_dict())
+    def pull_commit(self, commit_id: str) -> dict:
+        from mut.core.protocol import PullCommitRequest
+        req = PullCommitRequest(commit_id=commit_id)
+        return self._post("/pull-commit", req.to_dict())
 
-    def rollback(self, target_version: int) -> dict:
+    # Deprecated: kept temporarily to avoid breaking any stragglers.
+    pull_version = pull_commit
+
+    def rollback(self, target_commit_id: str) -> dict:
         from mut.core.protocol import RollbackRequest
-        req = RollbackRequest(target_version=target_version)
+        req = RollbackRequest(target_commit_id=target_commit_id)
         return self._post("/rollback", req.to_dict())
 
 
@@ -180,10 +183,10 @@ class AsyncMutClient:
     async def clone(self) -> dict:
         return await self._post("/clone", CloneRequest().to_dict())
 
-    async def push(self, base_version: int, snapshots: list,
+    async def push(self, base_commit_id: str, snapshots: list,
                    objects: dict[str, bytes]) -> dict:
         req = PushRequest(
-            base_version=base_version,
+            base_commit_id=base_commit_id,
             snapshots=snapshots,
             objects={h: base64.b64encode(data).decode()
                      for h, data in objects.items()},
@@ -194,10 +197,10 @@ class AsyncMutClient:
         req = NegotiateRequest(hashes=hashes)
         return await self._post("/negotiate", req.to_dict())
 
-    async def pull(self, since_version: int,
+    async def pull(self, since_commit_id: str,
                    have_hashes: list[str] | None = None) -> dict:
         req = PullRequest(
-            since_version=since_version,
+            since_commit_id=since_commit_id,
             have_hashes=have_hashes or [],
         )
         return await self._post("/pull", req.to_dict())

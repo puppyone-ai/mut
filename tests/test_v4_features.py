@@ -1,5 +1,5 @@
 """Tests for v4 remaining features: .env credentials, X-Mut-User header,
-pull-version endpoint, remote command, and client notification listener."""
+pull-commit endpoint, remote command, and client notification listener."""
 
 import asyncio
 import base64
@@ -8,10 +8,13 @@ import pytest
 
 from mut.server.repo import ServerRepo
 from mut.server.server import (
-    _handle_push, _handle_pull_version, _handle_clone,
+    _handle_push, _handle_pull_commit, _handle_clone,
 )
 from mut.foundation.config import load_env, get_client_credential
 from mut.foundation.transport import MutClient
+
+
+_SEED = "seedseedseedseed"
 
 
 def _run(coro):
@@ -27,7 +30,9 @@ def server_repo(tmp_path):
     repo = ServerRepo.init(str(tmp_path / "server"), project_name="test-proj")
     root = repo.build_full_tree()
     repo.set_root_hash(root)
-    repo.record_history(0, "server", "initial state", "/", [], root_hash=root)
+    repo.record_history(_SEED, "server", "initial state", "/", [],
+                        root_hash=root)
+    repo.set_head_commit_id(_SEED)
     return repo
 
 
@@ -44,10 +49,10 @@ def auth(rw_scope):
     return {"agent": "agent-A", "_scope": rw_scope}
 
 
-def _make_push_body(repo, files: dict, base_version: int = 0) -> dict:
+def _make_push_body(repo, files: dict, base_commit_id: str = "") -> dict:
     from mut.core import tree as tree_mod
 
-    nested = {}
+    nested: dict = {}
     for path, content in files.items():
         parts = path.split("/")
         d = nested
@@ -71,7 +76,7 @@ def _make_push_body(repo, files: dict, base_version: int = 0) -> dict:
     objects_b64 = {h: base64.b64encode(repo.store.get(h)).decode()
                    for h in reachable}
     return {
-        "base_version": base_version,
+        "base_commit_id": base_commit_id,
         "snapshots": [{"id": 1, "root": root_hash, "message": "test",
                        "who": "agent-A", "time": ""}],
         "objects": objects_b64,
@@ -157,61 +162,68 @@ class TestMutClientUserIdentity:
         c = MutClient("http://localhost:9742", "key")
         assert hasattr(c, "post")
 
-    def test_client_has_pull_version_method(self):
+    def test_client_has_pull_commit_method(self):
         c = MutClient("http://localhost:9742", "key")
-        assert hasattr(c, "pull_version")
+        assert hasattr(c, "pull_commit")
 
     def test_client_has_rollback_method(self):
         c = MutClient("http://localhost:9742", "key")
         assert hasattr(c, "rollback")
 
 
-# ── Pull Version endpoint ─────────────────────────────────────
+# ── Pull Commit endpoint ──────────────────────────────────────
 
-class TestPullVersion:
-    def test_pull_version_v1(self, server_repo, auth):
-        # Push v1
+class TestPullCommit:
+    def test_pull_specific_commit(self, server_repo, auth):
         body1 = _make_push_body(server_repo, {"a.txt": b"version-1"})
-        _run(_handle_push(server_repo, auth, body1))
+        r1 = _run(_handle_push(server_repo, auth, body1))
+        cid1 = r1["commit_id"]
 
-        # Push v2
-        body2 = _make_push_body(server_repo, {"a.txt": b"version-2"}, 1)
+        body2 = _make_push_body(server_repo, {"a.txt": b"version-2"},
+                                base_commit_id=cid1)
         _run(_handle_push(server_repo, auth, body2))
 
-        # Pull version 1 specifically
-        result = _run(_handle_pull_version(server_repo, auth, {"version": 1}))
+        result = _run(_handle_pull_commit(server_repo, auth,
+                                          {"commit_id": cid1}))
         assert result["status"] == "ok"
-        assert result["version"] == 1
+        assert result["commit_id"] == cid1
         content = base64.b64decode(result["files"]["a.txt"])
         assert content == b"version-1"
 
-    def test_pull_version_latest(self, server_repo, auth):
+    def test_pull_latest_commit(self, server_repo, auth):
         body = _make_push_body(server_repo, {"a.txt": b"latest"})
-        _run(_handle_push(server_repo, auth, body))
+        r = _run(_handle_push(server_repo, auth, body))
 
-        result = _run(_handle_pull_version(server_repo, auth, {"version": 1}))
-        assert result["version"] == 1
+        result = _run(_handle_pull_commit(server_repo, auth,
+                                          {"commit_id": r["commit_id"]}))
+        assert result["commit_id"] == r["commit_id"]
         assert base64.b64decode(result["files"]["a.txt"]) == b"latest"
 
-    def test_pull_version_invalid(self, server_repo, auth):
+    def test_pull_commit_missing_id(self, server_repo, auth):
         body = _make_push_body(server_repo, {"a.txt": b"data"})
         _run(_handle_push(server_repo, auth, body))
 
-        with pytest.raises(ValueError, match="invalid version"):
-            _run(_handle_pull_version(server_repo, auth, {"version": 0}))
+        with pytest.raises(ValueError):
+            _run(_handle_pull_commit(server_repo, auth, {"commit_id": ""}))
 
-        with pytest.raises(ValueError, match="invalid version"):
-            _run(_handle_pull_version(server_repo, auth, {"version": 999}))
-
-    def test_pull_version_includes_objects(self, server_repo, auth):
+    def test_pull_unknown_commit(self, server_repo, auth):
         body = _make_push_body(server_repo, {"a.txt": b"data"})
         _run(_handle_push(server_repo, auth, body))
 
-        result = _run(_handle_pull_version(server_repo, auth, {"version": 1}))
+        with pytest.raises(ValueError):
+            _run(_handle_pull_commit(server_repo, auth,
+                                     {"commit_id": "deadbeefdeadbeef"}))
+
+    def test_pull_commit_includes_objects(self, server_repo, auth):
+        body = _make_push_body(server_repo, {"a.txt": b"data"})
+        r = _run(_handle_push(server_repo, auth, body))
+
+        result = _run(_handle_pull_commit(server_repo, auth,
+                                          {"commit_id": r["commit_id"]}))
         assert len(result["objects"]) > 0
 
-    def test_pull_version_scoped(self, server_repo):
-        """Pull-version only returns files within the authenticated scope."""
+    def test_pull_commit_scoped(self, server_repo):
+        """Pull-commit only returns files within the authenticated scope."""
         server_repo.add_scope("scope-docs", "/docs/")
         docs_scope = server_repo.scopes.get_by_id("scope-docs")
         docs_scope["mode"] = "rw"
@@ -222,16 +234,14 @@ class TestPullVersion:
         src_scope["mode"] = "rw"
         src_auth = {"agent": "src-agent", "_scope": src_scope}
 
-        # Push to docs
         body_docs = _make_push_body(server_repo, {"readme.md": b"# Docs"})
-        _run(_handle_push(server_repo, docs_auth, body_docs))
+        r_docs = _run(_handle_push(server_repo, docs_auth, body_docs))
 
-        # Push to src
         body_src = _make_push_body(server_repo, {"main.py": b"print(1)"})
         _run(_handle_push(server_repo, src_auth, body_src))
 
-        # Pull version 1 as docs user -> only docs files
-        result = _run(_handle_pull_version(server_repo, docs_auth, {"version": 1}))
+        result = _run(_handle_pull_commit(server_repo, docs_auth,
+                                          {"commit_id": r_docs["commit_id"]}))
         assert "readme.md" in result["files"]
         assert "main.py" not in result["files"]
 
@@ -307,13 +317,14 @@ class TestNotificationListener:
             "http://localhost:9742", "key",
             on_notification=lambda msg: received.append(msg),
         )
+        cid = "a1b2c3d4e5f60718"
         listener._handle_message(json.dumps({
             "notification_id": "n1",
             "type": "version_update",
-            "version": 5,
+            "commit_id": cid,
         }).encode())
         assert len(received) == 1
-        assert received[0]["version"] == 5
+        assert received[0]["commit_id"] == cid
 
     def test_handle_message_idempotent(self):
         from mut.ops.notify_op import NotificationListener

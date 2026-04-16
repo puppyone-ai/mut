@@ -112,8 +112,15 @@ class SnapshotChain:
             return None
         return self._read_snap(latest_id)
 
-    def create(self, root_hash: str, who: str, message: str, pushed: bool = False):
-        """Create a new snapshot. Returns None if nothing changed since last."""
+    def create(self, root_hash: str, who: str, message: str,
+               pushed: bool = False,
+               server_commit_id: str = ""):
+        """Create a new snapshot. Returns None if nothing changed since last.
+
+        `id` is a local cursor (client-only; monotonic int).
+        `server_commit_id` is populated after a successful push (or when this
+        snapshot was created from a server pull). Empty until then.
+        """
         self._ensure_migrated()
         latest_id = self._get_latest_id()
 
@@ -130,6 +137,7 @@ class SnapshotChain:
             "message": message,
             "time": datetime.now(timezone.utc).isoformat(timespec="seconds"),
             "pushed": pushed,
+            "server_commit_id": server_commit_id,
         }
         self._write_snap(snap)
         write_text(self.dir / "latest", str(snap["id"]))
@@ -148,15 +156,22 @@ class SnapshotChain:
                 result.append(snap)
         return result
 
-    def mark_pushed(self, up_to_id: int):
+    def mark_pushed(self, up_to_id: int, server_commit_id: str = ""):
+        """Mark local snapshots ≤ up_to_id as pushed.
+
+        If `server_commit_id` is provided, it is stamped onto every snapshot
+        newly flipped to pushed in this call (so `mut log` can correlate the
+        local cursor with the server commit).
+        """
         self._ensure_migrated()
         latest = self._get_latest_id()
         watermark = self._get_pushed_watermark()
-        # Update individual files that aren't already pushed
         for i in range(watermark + 1, min(up_to_id, latest) + 1):
             snap = self._read_snap(i)
             if snap and not snap.get("pushed", False):
                 snap["pushed"] = True
+                if server_commit_id and not snap.get("server_commit_id"):
+                    snap["server_commit_id"] = server_commit_id
                 self._write_snap(snap)
         write_text(self.dir / "pushed", str(up_to_id))
 

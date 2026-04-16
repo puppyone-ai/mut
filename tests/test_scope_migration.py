@@ -1,4 +1,4 @@
-"""Tests for scope split/merge and history migration."""
+"""Tests for scope split/merge and history migration (commit-id identity)."""
 
 import pytest
 
@@ -21,7 +21,7 @@ def scopes(tmp_path):
 def history(tmp_path):
     d = tmp_path / "history"
     d.mkdir()
-    write_text(d / "latest", "0")
+    write_text(d / "latest", "")
     write_text(d / "root", "")
     return HistoryManager(FileSystemHistoryBackend(d))
 
@@ -35,7 +35,7 @@ class TestScopeSplit:
             {"id": "scope-docs-public", "path": "/docs/public/"},
         ])
         assert len(new_scopes) == 2
-        assert scopes.get_by_id("scope-docs") is None  # old scope deleted
+        assert scopes.get_by_id("scope-docs") is None
         assert scopes.get_by_id("scope-docs-internal")["path"] == "/docs/internal/"
         assert scopes.get_by_id("scope-docs-public")["path"] == "/docs/public/"
 
@@ -77,23 +77,26 @@ class TestFindByPathPrefix:
         assert len(results) >= 2  # docs + src
 
 
-# ── History migration ──────────────────────────────────────────
+# ── History migration (per-commit reattribution) ───────────────
 
 class TestHistoryMigration:
     def _seed_history(self, history):
-        """Create history entries under /docs/ scope."""
-        history.set_latest_version(0)
-        for v in range(1, 4):
+        """Create history entries under /docs/ scope (commit-id keyed)."""
+        cids = []
+        for i in range(1, 4):
+            cid = f"{i:016x}"
             changes = [
-                {"path": f"docs/internal/secret-{v}.md", "action": "add"},
-                {"path": f"docs/public/readme-{v}.md", "action": "add"},
+                {"path": f"docs/internal/secret-{i}.md", "action": "add"},
+                {"path": f"docs/public/readme-{i}.md", "action": "add"},
             ]
-            history.record(v, f"agent-{v}", f"commit {v}", "docs", changes,
-                           root_hash=f"hash-{v}")
-            history.set_latest_version(v)
+            history.record(cid, f"agent-{i}", f"commit {i}", "docs", changes,
+                           root_hash=f"hash-{i}")
+            history.set_head_commit_id(cid)
+            cids.append(cid)
+        return cids
 
     def test_migrate_splits_history(self, history):
-        self._seed_history(history)
+        cids = self._seed_history(history)
 
         count = history.migrate_scope(
             "docs",
@@ -103,21 +106,18 @@ class TestHistoryMigration:
             },
             fallback_scope="/",
         )
-        assert count == 3  # all 3 entries migrated
+        assert count == 3
 
-        # Each entry should now be attributed to the sub-scope with more matches
-        # Since each entry has one internal + one public change,
-        # the first matching prefix wins
-        for v in range(1, 4):
-            entry = history.get_entry(v)
+        for cid in cids:
+            entry = history.get_entry(cid)
             assert entry["scope"] in ("docs/internal", "docs/public")
 
     def test_migrate_no_match_goes_to_fallback(self, history):
-        history.set_latest_version(0)
-        history.record(1, "a", "msg", "docs",
+        cid = "aaaaaaaaaaaaaaaa"
+        history.record(cid, "a", "msg", "docs",
                        [{"path": "docs/other.txt", "action": "add"}],
                        root_hash="h1")
-        history.set_latest_version(1)
+        history.set_head_commit_id(cid)
 
         count = history.migrate_scope(
             "docs",
@@ -125,30 +125,29 @@ class TestHistoryMigration:
             fallback_scope="root",
         )
         assert count == 1
-        entry = history.get_entry(1)
+        entry = history.get_entry(cid)
         assert entry["scope"] == "root"
 
     def test_migrate_ignores_other_scopes(self, history):
-        self._seed_history(history)
-        # Add an entry under a different scope
-        history.record(4, "x", "other scope", "src",
+        cids = self._seed_history(history)
+        other_cid = "bbbbbbbbbbbbbbbb"
+        history.record(other_cid, "x", "other scope", "src",
                        [{"path": "src/main.py", "action": "add"}],
                        root_hash="h4")
-        history.set_latest_version(4)
+        history.set_head_commit_id(other_cid)
 
         count = history.migrate_scope(
             "docs",
             {"docs/internal": "docs/internal"},
             fallback_scope="/",
         )
-        # Only docs entries migrated, not src
         assert count == 3
-        assert history.get_entry(4)["scope"] == "src"  # unchanged
+        assert history.get_entry(other_cid)["scope"] == "src"
 
     def test_migrate_empty_changes_uses_fallback(self, history):
-        history.set_latest_version(0)
-        history.record(1, "a", "empty", "docs", [], root_hash="h")
-        history.set_latest_version(1)
+        cid = "cccccccccccccccc"
+        history.record(cid, "a", "empty", "docs", [], root_hash="h")
+        history.set_head_commit_id(cid)
 
         history.migrate_scope("docs", {"docs/x": "docs/x"}, fallback_scope="/")
-        assert history.get_entry(1)["scope"] == "/"
+        assert history.get_entry(cid)["scope"] == "/"

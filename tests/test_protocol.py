@@ -83,25 +83,30 @@ class TestScopeInfo:
 
 # ── PushRequest / PushResponse ─────────────────
 
+_CID_A = "a1b2c3d4e5f60718"
+_CID_B = "1122334455667788"
+
+
 class TestPush:
     def test_push_request_roundtrip(self):
-        req = PushRequest(base_version=3, snapshots=[{"id": 1}], objects={"abc": "base64"})
+        req = PushRequest(base_commit_id=_CID_A, snapshots=[{"id": 1}],
+                          objects={"abc": "base64"})
         d = req.to_dict()
         req2 = PushRequest.from_dict(d)
-        assert req2.base_version == 3
+        assert req2.base_commit_id == _CID_A
         assert req2.snapshots == [{"id": 1}]
         assert req2.objects == {"abc": "base64"}
         assert req2.protocol_version == PROTOCOL_VERSION
 
     def test_push_response_no_merge(self):
-        resp = PushResponse(status="ok", version=5, pushed=2, root="aabb")
+        resp = PushResponse(status="ok", commit_id=_CID_B, pushed=2, root="aabb")
         d = resp.to_dict()
         assert "merged" not in d
         assert d["status"] == "ok"
-        assert d["version"] == 5
+        assert d["commit_id"] == _CID_B
 
     def test_push_response_with_merge(self):
-        resp = PushResponse(status="ok", version=5, pushed=2, root="aabb",
+        resp = PushResponse(status="ok", commit_id=_CID_B, pushed=2, root="aabb",
                             merged=True, conflicts=3)
         d = resp.to_dict()
         assert d["merged"] is True
@@ -112,25 +117,25 @@ class TestPush:
 
 class TestPull:
     def test_pull_request_roundtrip(self):
-        req = PullRequest(since_version=7, have_hashes=["aaa", "bbb"])
+        req = PullRequest(since_commit_id=_CID_A, have_hashes=["aaa", "bbb"])
         d = req.to_dict()
         req2 = PullRequest.from_dict(d)
-        assert req2.since_version == 7
+        assert req2.since_commit_id == _CID_A
         assert req2.have_hashes == ["aaa", "bbb"]
 
     def test_pull_request_omits_empty_hashes(self):
-        req = PullRequest(since_version=0)
+        req = PullRequest(since_commit_id="")
         d = req.to_dict()
         # Empty have_hashes is omitted from the dict to save bandwidth
         assert "have_hashes" not in d
 
     def test_pull_response(self):
-        resp = PullResponse(status="updated", version=10,
+        resp = PullResponse(status="updated", head_commit_id=_CID_B,
                             files={"a.txt": "b64"}, objects={"h": "b64"},
                             history=[{"id": 1}])
         d = resp.to_dict()
         assert d["status"] == "updated"
-        assert d["version"] == 10
+        assert d["head_commit_id"] == _CID_B
         assert "a.txt" in d["files"]
 
 

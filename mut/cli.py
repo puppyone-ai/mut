@@ -133,9 +133,10 @@ def cmd_status(args):
     config = load_config(repo.mut_root)
     result["server"] = config.get("server", "")
     latest = repo.snapshots.latest()
-    result["local_version"] = latest["id"] if latest else 0
+    result["local_snapshot_id"] = latest["id"] if latest else 0
     rh_path = repo.mut_root / REMOTE_HEAD_FILE
-    result["remote_version"] = int(read_text(rh_path)) if rh_path.exists() else None
+    remote_cid = read_text(rh_path).strip() if rh_path.exists() else ""
+    result["remote_commit_id"] = remote_cid or None
 
     if _output(result, _json_flag(args)):
         return
@@ -143,9 +144,9 @@ def cmd_status(args):
     server = config.get("server", "")
     if server:
         print(f"  access point: {server}")
-    print(f"  local version: {result['local_version']}")
-    if result["remote_version"] is not None:
-        print(f"  remote version: {result['remote_version']}")
+    print(f"  local snapshot: #{result['local_snapshot_id']}")
+    if result["remote_commit_id"]:
+        print(f"  remote commit: {result['remote_commit_id'][:8]}")
 
     if not changes:
         print("  clean — no changes since last snapshot")
@@ -239,8 +240,9 @@ def cmd_push(args):
         print("Everything up-to-date")
     else:
         print(f"Pushed {result['pushed']} snapshot(s)")
-        if result.get("server_version"):
-            print(f"  server version: {result['server_version']}")
+        server_cid = result.get("server_commit_id")
+        if server_cid:
+            print(f"  server commit: {server_cid[:8]}")
         if result.get("merged"):
             print(f"  auto-merged ({result.get('conflicts', 0)} "
                   "conflict(s) resolved)")
@@ -272,20 +274,24 @@ def cmd_pull(args):
         print("Already up-to-date")
     else:
         print(f"Pulled {result['pulled']} file(s) from server")
-        if result.get("server_version"):
-            print(f"  server version: {result['server_version']}")
+        server_cid = result.get("server_commit_id")
+        if server_cid:
+            print(f"  server commit: {server_cid[:8]}")
 
 
 def cmd_rollback(args):
     repo = MutRepo(".")
-    result = rollback_op.rollback(repo, args.version)
+    result = rollback_op.rollback(repo, args.commit_id)
     if _output(result, _json_flag(args)):
         return
-    if result["status"] == "already-at-version":
-        print(f"Already at version {args.version}")
+    if result["status"] == "already-at-commit":
+        print(f"Already at commit {args.commit_id[:8]}")
     else:
-        print(f"Rolled back to v{result['target_version']}")
-        print(f"  new server version: v{result['new_version']}")
+        target = result.get("target_commit_id", args.commit_id)
+        new_cid = result.get("commit_id", "")
+        print(f"Rolled back to #{target[:8]}")
+        if new_cid:
+            print(f"  new server commit: #{new_cid[:8]}")
         changes = result.get("changes", [])
         if changes:
             print(f"  {len(changes)} file(s) changed")
@@ -345,7 +351,9 @@ def cmd_link(args):
         return
 
     print(f"Linked to {result['server']}")
-    print(f"  server version: {result['server_version']}")
+    server_cid = result.get("server_commit_id", "")
+    if server_cid:
+        print(f"  server commit: {server_cid[:8]}")
     if result.get("scope_created"):
         print(f"  created scope directory: {args.dir_name}/")
     if result.get("scope_push_error"):
@@ -404,9 +412,9 @@ def main():
                         help="Overwrite uncommitted local changes")
 
     p_rollback = sub.add_parser("rollback",
-                                help="Rollback server to a historical version")
-    p_rollback.add_argument("version", type=int,
-                            help="Target version number to rollback to")
+                                help="Rollback server to a historical commit")
+    p_rollback.add_argument("commit_id", type=str,
+                            help="Target commit id (16-hex) to rollback to")
 
     sub.add_parser("stats", help="Repository statistics")
 

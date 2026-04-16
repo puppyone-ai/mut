@@ -13,16 +13,23 @@ from mut.server.handlers import (
     handle_clone, handle_push, handle_pull,
     handle_negotiate,
 )
-from mut.foundation.error import PermissionDenied, LockError
+from mut.server.history import HistoryManager
+from mut.foundation.error import PermissionDenied
+
+
+_CID_SEED = "a1b2c3d4e5f60718"
 
 
 @pytest.fixture
 def server_repo(tmp_path):
     repo = ServerRepo.init(str(tmp_path / "server"), project_name="test-proj")
-    # Build initial tree + version 0
+    # Seed: build initial tree and one "initial" commit so pulls have a baseline.
     root = repo.build_full_tree()
     repo.set_root_hash(root)
-    repo.record_history(0, "server", "initial state", "/", [], root_hash=root)
+    repo.record_history(
+        _CID_SEED, "server", "initial state", "/", [], root_hash=root,
+    )
+    repo.set_head_commit_id(_CID_SEED)
     return repo
 
 
@@ -40,23 +47,13 @@ def auth(rw_scope):
     return {"agent": "agent-A", "_scope": rw_scope}
 
 
-def _make_push_body(files: dict[str, bytes], base_version: int = 0) -> dict:
-    """Helper: build push body with a tree from file content dict."""
-    # We'll construct the tree manually via object_store
-    return {
-        "base_version": base_version,
-        "snapshots": [],
-        "objects": {},
-    }
-
-
 class TestHandleClone:
     def test_clone_empty_scope(self, server_repo, auth):
         result = handle_clone(server_repo, auth, {})
         assert result["project"] == "test-proj"
         assert isinstance(result["files"], dict)
         assert isinstance(result["objects"], dict)
-        assert isinstance(result["version"], int)
+        assert "head_commit_id" in result
         assert result["scope"]["path"] == "/src/"
 
     def test_clone_with_files(self, server_repo, auth):
@@ -74,17 +71,14 @@ class TestHandleClone:
 
 class TestHandlePush:
     def _push_with_files(self, server_repo, auth, files: dict[str, bytes],
-                         base_version: int = 0):
+                         base_commit_id: str = ""):
         """Helper: build a valid push body with tree + objects."""
-        scope = auth["_scope"]
-        # Build tree objects the same way ServerRepo does
         from mut.core import tree as tree_mod
 
-        for path, content in files.items():
+        for content in files.values():
             server_repo.store.put(content)
 
-        # Build a tree from files
-        nested = {}
+        nested: dict = {}
         for path, content in files.items():
             parts = path.split("/")
             d = nested
@@ -101,18 +95,22 @@ class TestHandlePush:
                 else:
                     sub_hash = write_nested(val)
                     entries[name] = ["T", sub_hash]
-            return server_repo.store.put(json.dumps(entries, sort_keys=True).encode())
+            return server_repo.store.put(
+                json.dumps(entries, sort_keys=True).encode()
+            )
 
         root_hash = write_nested(nested)
 
-        # Collect all objects
-        reachable = tree_mod.collect_reachable_hashes(server_repo.store, root_hash)
-        objects_b64 = {}
-        for h in reachable:
-            objects_b64[h] = base64.b64encode(server_repo.store.get(h)).decode()
+        reachable = tree_mod.collect_reachable_hashes(
+            server_repo.store, root_hash,
+        )
+        objects_b64 = {
+            h: base64.b64encode(server_repo.store.get(h)).decode()
+            for h in reachable
+        }
 
         body = {
-            "base_version": base_version,
+            "base_commit_id": base_commit_id,
             "snapshots": [{"id": 1, "root": root_hash, "message": "test push",
                            "who": "agent-A", "time": ""}],
             "objects": objects_b64,
@@ -121,17 +119,18 @@ class TestHandlePush:
 
     def test_push_empty_snapshots(self, server_repo, auth):
         result = handle_push(server_repo, auth, {
-            "base_version": 0, "snapshots": [], "objects": {},
+            "base_commit_id": "", "snapshots": [], "objects": {},
         })
         assert result["status"] == "ok"
 
     def test_push_creates_files(self, server_repo, auth):
-        result = self._push_with_files(server_repo, auth, {"main.py": b"hello"})
+        result = self._push_with_files(
+            server_repo, auth, {"main.py": b"hello"},
+        )
         assert result["status"] == "ok"
-        assert result["version"] == 1
+        assert len(result["commit_id"]) == 16  # 16-hex SHA256 prefix
         assert result["pushed"] == 1
 
-        # Verify files were written
         scope = auth["_scope"]
         files = server_repo.list_scope_files(scope)
         assert "main.py" in files
@@ -145,58 +144,79 @@ class TestHandlePush:
             handle_push(server_repo, ro_auth, {})
 
     def test_push_cas_retry_on_concurrent_update(self, server_repo, auth):
-        """CAS push fails when scope_hash changes between read and write."""
-        result = self._push_with_files(server_repo, auth, {"a.py": b"first"})
-        assert result["status"] == "ok"
+        """Stale base_commit_id still succeeds via server-side merge."""
+        r1 = self._push_with_files(server_repo, auth, {"a.py": b"first"})
+        assert r1["status"] == "ok"
 
-        # Second push with stale base_version should still succeed (CAS + merge)
-        result2 = self._push_with_files(server_repo, auth, {"b.py": b"second"},
-                                         base_version=0)
-        assert result2["status"] == "ok"
+        r2 = self._push_with_files(
+            server_repo, auth, {"b.py": b"second"},
+            base_commit_id="",  # stale (empty) base
+        )
+        assert r2["status"] == "ok"
 
-    def test_push_increments_version(self, server_repo, auth):
-        result1 = self._push_with_files(server_repo, auth, {"a.py": b"v1"})
-        assert result1["version"] == 1
+    def test_push_returns_new_commit_id(self, server_repo, auth):
+        r1 = self._push_with_files(server_repo, auth, {"a.py": b"v1"})
+        r2 = self._push_with_files(
+            server_repo, auth, {"a.py": b"v2"},
+            base_commit_id=r1["commit_id"],
+        )
+        assert r1["commit_id"] != r2["commit_id"]
+        assert len(r1["commit_id"]) == 16
+        assert len(r2["commit_id"]) == 16
 
-        result2 = self._push_with_files(server_repo, auth, {"a.py": b"v2"},
-                                         base_version=1)
-        assert result2["version"] == 2
+    def test_push_commit_id_is_deterministic_from_payload(self, server_repo):
+        """compute_commit_id is a pure function of (scope, hash, time, who)."""
+        cid_a = HistoryManager.compute_commit_id(
+            scope_path="/src/", scope_hash="a" * 16,
+            created_at_iso="2026-01-01T00:00:00+00:00",
+            who="alice",
+        )
+        cid_b = HistoryManager.compute_commit_id(
+            scope_path="/src/", scope_hash="a" * 16,
+            created_at_iso="2026-01-01T00:00:00+00:00",
+            who="alice",
+        )
+        assert cid_a == cid_b
 
 
 class TestHandlePull:
     def test_pull_up_to_date(self, server_repo, auth):
-        result = handle_pull(server_repo, auth, {"since_version": 0})
+        """No commits for this scope yet → returns baseline head."""
+        server_repo.history.set_scope_head_commit_id("/src/", _CID_SEED)
+        result = handle_pull(server_repo, auth,
+                             {"since_commit_id": _CID_SEED})
         assert result["status"] == "up-to-date"
 
     def test_pull_after_push(self, server_repo, auth):
         scope = auth["_scope"]
         server_repo.write_scope_files(scope, {"f.txt": b"content"})
-        root = server_repo.build_full_tree()
-        server_repo.set_root_hash(root)
-        server_repo.set_latest_version(1)
-        server_repo.record_history(1, "agent-A", "push", "/src/",
+        cid = "1111111111111111"
+        server_repo.record_history(cid, "agent-A", "push", "/src/",
                                    [{"path": "src/f.txt", "action": "add"}])
+        server_repo.history.set_scope_head_commit_id("/src/", cid)
+        server_repo.set_head_commit_id(cid)
 
-        result = handle_pull(server_repo, auth, {"since_version": 0})
+        result = handle_pull(server_repo, auth, {"since_commit_id": ""})
         assert result["status"] == "updated"
-        assert result["version"] == 1
+        assert result["head_commit_id"] == cid
         assert "f.txt" in result["files"]
 
     def test_pull_skips_known_objects(self, server_repo, auth):
         scope = auth["_scope"]
         server_repo.write_scope_files(scope, {"f.txt": b"content"})
-        root = server_repo.build_full_tree()
-        server_repo.set_root_hash(root)
-        server_repo.set_latest_version(1)
-        server_repo.record_history(1, "a", "push", "/src/", [])
+        cid = "2222222222222222"
+        server_repo.record_history(cid, "a", "push", "/src/", [])
+        server_repo.history.set_scope_head_commit_id("/src/", cid)
+        server_repo.set_head_commit_id(cid)
 
-        # Get all hashes the server has for this scope
         from mut.core import tree as tree_mod
         scope_tree = server_repo.build_scope_tree(scope)
-        all_hashes = list(tree_mod.collect_reachable_hashes(server_repo.store, scope_tree))
+        all_hashes = list(
+            tree_mod.collect_reachable_hashes(server_repo.store, scope_tree)
+        )
 
         result = handle_pull(server_repo, auth, {
-            "since_version": 0,
+            "since_commit_id": "",
             "have_hashes": all_hashes,
         })
         assert result["objects"] == {}  # client already has everything
@@ -204,12 +224,14 @@ class TestHandlePull:
 
 class TestHandleNegotiate:
     def test_negotiate_all_missing(self, server_repo, auth):
-        result = handle_negotiate(server_repo, auth, {"hashes": ["aaa", "bbb"]})
+        result = handle_negotiate(server_repo, auth,
+                                  {"hashes": ["aaa", "bbb"]})
         assert set(result["missing"]) == {"aaa", "bbb"}
 
     def test_negotiate_some_present(self, server_repo, auth):
         h = server_repo.store.put(b"existing object")
-        result = handle_negotiate(server_repo, auth, {"hashes": [h, "missing"]})
+        result = handle_negotiate(server_repo, auth,
+                                  {"hashes": [h, "missing"]})
         assert "missing" in result["missing"]
         assert h not in result["missing"]
 

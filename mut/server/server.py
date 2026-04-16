@@ -5,13 +5,17 @@ resolves credentials into an auth context (agent + scope + mode).
 MUT core never touches credentials directly.
 
 Endpoints:
-  POST /clone      — Agent requests scope files + history
-  POST /push       — Agent pushes local commits (with auto-merge)
-  POST /pull       — Agent pulls changes since a version
-  POST /negotiate  — Hash negotiation for object dedup
-  GET  /health     — Health check
+  POST /clone         — Agent requests scope files + history
+  POST /push          — Agent pushes local commits (with auto-merge)
+  POST /pull          — Agent pulls changes since a commit_id
+  POST /negotiate     — Hash negotiation for object dedup
+  POST /rollback      — Rollback to a historical commit
+  POST /pull-commit   — Fetch files at a specific commit
+  POST /pull-version  — Deprecated alias for /pull-commit
+  GET  /health        — Health check
 
 Push never fails — conflicts are resolved server-side via three-way merge + LWW.
+Commit identity is a 16-hex SHA256 hash of (scope_path, scope_hash, created_at, who).
 """
 
 from __future__ import annotations
@@ -19,6 +23,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+from datetime import datetime, timezone
 
 from mut.foundation.config import normalize_path, HASH_LEN
 from mut.core.protocol import PROTOCOL_VERSION
@@ -118,14 +123,14 @@ async def _handle_clone(repo: ServerRepo, auth: dict, _body: dict) -> dict:
     objects_b64 = {h: base64.b64encode(repo.store.get(h)).decode()
                    for h in scope_hashes}
 
-    latest = await repo.async_get_latest_version()
-    history = await repo.async_get_history_since(0, scope_path=scope["path"],
+    head_commit_id = await repo.async_get_head_commit_id()
+    history = await repo.async_get_history_since("", scope_path=scope["path"],
                                                  limit=MAX_CLONE_HISTORY)
 
     await repo.async_record_audit("clone", auth["agent"], {
         "scope": scope["path"],
         "files": len(files_raw),
-        "version": latest,
+        "commit_id": head_commit_id,
     })
 
     return {
@@ -134,7 +139,7 @@ async def _handle_clone(repo: ServerRepo, auth: dict, _body: dict) -> dict:
         "files": files_b64,
         "objects": objects_b64,
         "history": history,
-        "version": latest,
+        "head_commit_id": head_commit_id,
         "scope": {
             "path": scope["path"],
             "exclude": scope.get("exclude", []),
@@ -161,20 +166,19 @@ async def _push_locked(repo: ServerRepo, scope: dict, auth: dict,
                        body: dict) -> dict:
     """Core push logic — runs under scope queue (no global lock needed).
 
-    Per-scope versioning: each scope has its own version counter and
-    tree hash. The global version is a simple counter for cross-scope
-    ordering. No graft, no global root hash.
+    Per-scope commit identity: each push produces a commit_id scoped to
+    the target scope_path. No graft, no global root hash.
     """
     objects_b64 = body.get("objects", {})
     snapshots = body.get("snapshots", [])
-    base_version = body.get("base_version", 0)
+    base_commit_id = body.get("base_commit_id", "")
 
     for _h, b64data in objects_b64.items():
         await repo.store.async_put(base64.b64decode(b64data))
 
     if not snapshots:
-        version = await repo.async_get_latest_version()
-        return {"status": "ok", "version": version}
+        commit_id = await repo.async_get_scope_head_commit_id(scope["path"])
+        return {"status": "ok", "commit_id": commit_id}
 
     their_root_hash = snapshots[-1]["root"]
     their_files = await _async_flatten_tree(repo, their_root_hash)
@@ -188,17 +192,17 @@ async def _push_locked(repo: ServerRepo, scope: dict, auth: dict,
         raise PermissionDenied(f"paths outside scope: {rejected[:5]}")
 
     our_files = await repo.async_list_scope_files(scope)
-    current_version = await repo.async_get_latest_version()
+    current_head_commit = await repo.async_get_scope_head_commit_id(scope["path"])
 
     merged_files, merge_conflicts = _resolve_conflicts(
-        repo, scope, base_version, current_version, our_files, their_files,
+        repo, scope, base_commit_id, current_head_commit, our_files, their_files,
     )
 
     if merge_conflicts:
         await repo.async_record_audit("merge_conflict", auth["agent"], {
             "scope": scope["path"],
-            "base_version": base_version,
-            "server_version": current_version,
+            "base_commit_id": base_commit_id,
+            "server_commit_id": current_head_commit,
             "conflicts": [
                 {"path": c.path, "strategy": c.strategy,
                  "detail": c.detail, "kept": c.kept,
@@ -209,37 +213,32 @@ async def _push_locked(repo: ServerRepo, scope: dict, auth: dict,
 
     await _async_apply_merged_files(repo, scope, our_files, merged_files)
 
-    # Build new scope tree hash (no graft needed — scope-level only)
     new_scope_hash = await repo.async_build_scope_tree(scope)
 
-    # Update scope-level version (independent per scope)
-    scope_ver = await repo.async_get_scope_version(scope["path"])
-    new_scope_ver = scope_ver + 1
-    scope_version_id = HistoryManager.make_scope_version_id(
-        scope["path"], new_scope_ver,
+    created_at_iso = datetime.now(timezone.utc).isoformat(timespec="microseconds")
+    new_commit_id = HistoryManager.compute_commit_id(
+        scope_path=scope["path"],
+        scope_hash=new_scope_hash,
+        created_at_iso=created_at_iso,
+        who=auth["agent"],
     )
-
-    # Atomic global version increment (synchronous, no await between
-    # read+write, safe within asyncio even with parallel sibling scopes)
-    new_version = repo.next_global_version()
     changes = _compute_changeset(scope_prefix, our_files, merged_files)
 
     await repo.async_record_history(
-        new_version, auth["agent"], snapshots[-1].get("message", ""),
+        new_commit_id, auth["agent"], snapshots[-1].get("message", ""),
         scope["path"], changes,
         conflicts=merge_conflicts,
         scope_hash=new_scope_hash,
-        scope_version=scope_version_id,
+        created_at_iso=created_at_iso,
     )
-    # Version already persisted by next_global_version()
-    await repo.history.async_set_scope_version(scope["path"], new_scope_ver)
+    await repo.history.async_set_scope_head_commit_id(scope["path"], new_commit_id)
     await repo.history.async_set_scope_hash(scope["path"], new_scope_hash)
+    await repo.async_set_head_commit_id(new_commit_id)
 
     await repo.async_record_audit("push", auth["agent"], {
         "scope": scope["path"],
         "snapshots": len(snapshots),
-        "version": new_version,
-        "scope_version": scope_version_id,
+        "commit_id": new_commit_id,
         "scope_hash": new_scope_hash,
         "merged": bool(merge_conflicts),
         "conflict_count": len(merge_conflicts),
@@ -247,8 +246,7 @@ async def _push_locked(repo: ServerRepo, scope: dict, auth: dict,
 
     result = {
         "status": "ok",
-        "version": new_version,
-        "scope_version": scope_version_id,
+        "commit_id": new_commit_id,
         "pushed": len(snapshots),
         "scope_hash": new_scope_hash,
     }
@@ -256,11 +254,10 @@ async def _push_locked(repo: ServerRepo, scope: dict, auth: dict,
         result["merged"] = True
         result["conflicts"] = len(merge_conflicts)
 
-    # Fire post-push hook (notifications, etc.)
     hook = getattr(repo, '_post_push_hook', None)
     if hook is not None:
         try:
-            await hook(scope["path"], new_version, auth["agent"], changes)
+            await hook(scope["path"], new_commit_id, auth["agent"], changes)
         except Exception as exc:
             print(f"[mut-server] warning: post-push hook failed: {exc}")
 
@@ -283,7 +280,7 @@ async def _handle_negotiate(repo: ServerRepo, _auth: dict, body: dict) -> dict:
 
 
 async def _handle_rollback(repo: ServerRepo, auth: dict, body: dict) -> dict:
-    """Rollback to a historical version (async wrapper around sync handler)."""
+    """Rollback to a historical commit (async wrapper around sync handler)."""
     scope = auth["_scope"]
     if scope.get("mode", "r") == "r":
         raise PermissionDenied("scope is read-only")
@@ -297,21 +294,25 @@ async def _handle_rollback(repo: ServerRepo, auth: dict, body: dict) -> dict:
         repo._scope_queue.release(scope_path)
 
 
-async def _handle_pull_version(repo: ServerRepo, auth: dict, body: dict) -> dict:
-    """Pull files at a specific historical version."""
-    from mut.server.handlers import handle_pull_version
-    return await asyncio.to_thread(handle_pull_version, repo, auth, body)
+async def _handle_pull_commit(repo: ServerRepo, auth: dict, body: dict) -> dict:
+    """Pull files at a specific historical commit."""
+    from mut.server.handlers import handle_pull_commit
+    return await asyncio.to_thread(handle_pull_commit, repo, auth, body)
+
+
+# Deprecated alias — maintained so older callers and tests keep working.
+_handle_pull_version = _handle_pull_commit
 
 
 async def _handle_pull(repo: ServerRepo, auth: dict, body: dict) -> dict:
     scope = auth["_scope"]
-    since_version = body.get("since_version", 0)
-    latest = await repo.async_get_latest_version()
+    since_commit_id = body.get("since_commit_id", "")
+    head_commit_id = await repo.async_get_scope_head_commit_id(scope["path"])
 
-    if since_version >= latest:
+    if since_commit_id and since_commit_id == head_commit_id:
         return {
             "status": "up-to-date",
-            "version": latest,
+            "head_commit_id": head_commit_id,
             "files": {},
             "objects": {},
             "history": [],
@@ -326,18 +327,18 @@ async def _handle_pull(repo: ServerRepo, auth: dict, body: dict) -> dict:
     objects_b64 = {h: base64.b64encode(repo.store.get(h)).decode()
                    for h in scope_hashes if h not in have_hashes}
 
-    history = await repo.async_get_history_since(since_version,
+    history = await repo.async_get_history_since(since_commit_id,
                                                  scope_path=scope["path"])
 
     await repo.async_record_audit("pull", auth["agent"], {
         "scope": scope["path"],
-        "since": since_version,
-        "version": latest,
+        "since_commit_id": since_commit_id,
+        "commit_id": head_commit_id,
     })
 
     return {
         "status": "updated",
-        "version": latest,
+        "head_commit_id": head_commit_id,
         "files": files_b64,
         "objects": objects_b64,
         "history": history,
@@ -356,7 +357,8 @@ _POST_ROUTES = {
     "/pull": _handle_pull,
     "/negotiate": _handle_negotiate,
     "/rollback": _handle_rollback,
-    "/pull-version": _handle_pull_version,
+    "/pull-commit": _handle_pull_commit,
+    "/pull-version": _handle_pull_commit,  # deprecated alias
 }
 
 
@@ -396,7 +398,6 @@ async def _handle_connection(repo: ServerRepo, authenticator: Authenticator,
     try:
         method, path, headers = await _read_request(reader)
 
-        # WebSocket upgrade for /ws
         if (method == "GET" and path == "/ws"
                 and "upgrade" in headers.get("connection", "").lower()
                 and ws_mgr is not None):
@@ -450,10 +451,8 @@ async def _handle_ws_upgrade(_repo: ServerRepo, authenticator: Authenticator,
     )
     ws_mgr.register(ws_client)
 
-    # Flush any offline queued notifications
     await ws_mgr.flush_offline(ws_client)
 
-    # Keep connection alive — read frames (pong/ack/close)
     try:
         while not ws_client.is_closed:
             frame = await _read_ws_frame(reader)
@@ -462,7 +461,6 @@ async def _handle_ws_upgrade(_repo: ServerRepo, authenticator: Authenticator,
             opcode, _data = frame
             if opcode == 0x8:  # close
                 break
-            # 0x9 = ping → send pong
             if opcode == 0x9:
                 from mut.server.websocket import _send_ws_frame
                 await _send_ws_frame(writer, _data, opcode=0xA)
@@ -484,10 +482,10 @@ def _validate_scope_paths(scope: dict, scope_prefix: str, files: dict) -> list:
     return rejected
 
 
-def _resolve_conflicts(repo, scope, base_version, current_version,
+def _resolve_conflicts(repo, scope, base_commit_id, current_head_commit,
                        our_files, their_files):
-    if base_version < current_version:
-        base_files = _get_base_files(repo, scope, base_version)
+    if base_commit_id and current_head_commit and base_commit_id != current_head_commit:
+        base_files = _get_base_files(repo, scope, base_commit_id)
         return merge_file_sets(base_files, our_files, their_files)
     return their_files, []
 
@@ -533,26 +531,19 @@ def _navigate_tree(store, tree_hash: str, parts: list) -> str | None:
     return _navigate_tree(store, h, parts[1:])
 
 
-def _get_base_files(repo, scope, base_version) -> dict:
-    """Get scope files at a historical version for three-way merge base.
-
-    Uses scope_hash from the history entry directly (no global root
-    tree navigation needed). Falls back to legacy root hash for
-    backwards compatibility with pre-scope-hash history entries.
-    """
-    entry = repo.get_history_entry(base_version)
+def _get_base_files(repo, scope, base_commit_id) -> dict:
+    """Get scope files at a historical commit for three-way merge base."""
+    entry = repo.get_history_entry(base_commit_id)
     if not entry:
         return {}
 
     try:
-        # Prefer scope_hash (new per-scope versioning)
         scope_hash = entry.get("scope_hash", "")
         if scope_hash and repo.store.exists(scope_hash):
             flat_hashes = tree_mod.tree_to_flat(repo.store, scope_hash)
             return {path: repo.store.get(h)
                     for path, h in flat_hashes.items()}
 
-        # Fallback: legacy root hash + tree navigation
         root = entry.get("root", "")
         if root and repo.store.exists(root):
             scope_prefix = normalize_path(scope["path"])
@@ -564,10 +555,10 @@ def _get_base_files(repo, scope, base_version) -> dict:
                         for path, h in flat_hashes.items()}
     except (KeyError, json.JSONDecodeError) as exc:
         print(f"[mut-server] warning: failed to read base "
-              f"v{base_version}: {exc}")
+              f"#{base_commit_id[:8]}: {exc}")
     except ObjectNotFoundError as exc:
         print(f"[mut-server] warning: missing object for base "
-              f"v{base_version}: {exc}")
+              f"#{base_commit_id[:8]}: {exc}")
     return {}
 
 
@@ -594,20 +585,15 @@ async def async_serve(repo_root: str, host: str = "127.0.0.1",
 
     ws_manager = WebSocketManager()
 
-    async def _post_push_hook(scope_path, version, pushed_by, changes):
+    async def _post_push_hook(scope_path, commit_id, pushed_by, changes):
         notif = notification_manager.create_notification(
-            scope_path, version, pushed_by, changes,
+            scope_path, commit_id, pushed_by, changes,
         )
         await ws_manager.broadcast(
             notif.to_dict(), exclude=pushed_by, scope_path=scope_path,
         )
 
     repo._post_push_hook = _post_push_hook
-
-    if repo.get_latest_version() == 0:
-        repo.record_history(
-            0, "server", "initial state", "/", [],
-        )
 
     active_tasks: set[asyncio.Task] = set()
 
@@ -622,10 +608,11 @@ async def async_serve(repo_root: str, host: str = "127.0.0.1",
 
     server = await asyncio.start_server(on_connection, host, port)
     auth_name = type(authenticator).__name__
+    head = repo.get_head_commit_id() or "(empty)"
     print(f"Mut server listening on http://{host}:{port}")
     print(f"  repo: {repo.root}")
     print(f"  auth: {auth_name}")
-    print(f"  version: {repo.get_latest_version()}")
+    print(f"  head: #{head[:8] if head != '(empty)' else head}")
 
     try:
         async with server:

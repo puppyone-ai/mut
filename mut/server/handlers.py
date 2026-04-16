@@ -6,19 +6,25 @@ touch credentials directly.
 
 Errors are raised as MutError subclasses; the dispatch layer maps
 them to HTTP status codes.
+
+Commit identity: each successful push/rollback produces a commit_id
+(16-hex SHA256 of scope_path|scope_hash|created_at_iso|who). The
+per-scope head_commit_id is advanced alongside scope_hash, and both
+are used for CAS.
 """
 
 from __future__ import annotations
 
 import base64
 import json
+from datetime import datetime, timezone
 
 from mut.core.merge import merge_file_sets
 from mut.core.object_store import ObjectStore
 from mut.core.protocol import (
     CloneResponse, PushRequest, PushResponse, PullRequest, PullResponse,
     NegotiateRequest, NegotiateResponse, RollbackRequest, RollbackResponse,
-    PullVersionRequest, ScopeInfo, normalize_path,
+    PullCommitRequest, ScopeInfo, normalize_path,
 )
 from mut.core.scope import check_path_permission
 from mut.core import tree as tree_mod
@@ -44,14 +50,14 @@ def handle_clone(repo: ServerRepo, auth: dict, _body: dict) -> dict:
                    for h in scope_hashes}
 
     MAX_CLONE_HISTORY = 200
-    latest = repo.get_latest_version()
-    history = repo.get_history_since(0, scope_path=scope["path"],
+    head_commit_id = repo.get_head_commit_id()
+    history = repo.get_history_since("", scope_path=scope["path"],
                                      limit=MAX_CLONE_HISTORY)
 
     repo.record_audit("clone", auth["agent"], {
         "scope": scope["path"],
         "files": len(files_raw),
-        "version": latest,
+        "commit_id": head_commit_id,
     })
 
     resp = CloneResponse(
@@ -60,7 +66,7 @@ def handle_clone(repo: ServerRepo, auth: dict, _body: dict) -> dict:
         files=files_b64,
         objects=objects_b64,
         history=history,
-        version=latest,
+        head_commit_id=head_commit_id,
         scope=ScopeInfo(
             path=scope["path"],
             exclude=scope.get("exclude", []),
@@ -85,7 +91,7 @@ def handle_push(repo: ServerRepo, auth: dict, body: dict) -> dict:
 
     if not req.snapshots:
         return PushResponse(
-            status="ok", version=repo.get_latest_version(),
+            status="ok", commit_id=repo.get_scope_head_commit_id(scope["path"]),
         ).to_dict()
 
     their_root_hash = req.snapshots[-1]["root"]
@@ -119,18 +125,18 @@ def _push_cas_attempt(
     """Single CAS push attempt. Returns result dict on success, None on CAS failure."""
     old_scope_hash = repo.get_scope_hash(scope["path"])
     our_files = repo.list_scope_files(scope)
-    current_version = repo.get_latest_version()
+    current_head_commit = repo.get_scope_head_commit_id(scope["path"])
 
     merged_files, merge_conflicts = _resolve_conflicts(
-        repo, scope, req.base_version, current_version,
+        repo, scope, req.base_commit_id, current_head_commit,
         our_files, their_files,
     )
 
     if merge_conflicts:
         repo.record_audit("merge_conflict", auth["agent"], {
             "scope": scope["path"],
-            "base_version": req.base_version,
-            "server_version": current_version,
+            "base_commit_id": req.base_commit_id,
+            "server_commit_id": current_head_commit,
             "attempt": attempt,
             "conflicts": [
                 {"path": c.path, "strategy": c.strategy,
@@ -144,35 +150,40 @@ def _push_cas_attempt(
 
     new_scope_hash = repo.build_scope_tree(scope)
 
-    # CAS: only succeeds if scope_hash hasn't changed since we read it
-    if not repo.cas_update_scope(scope["path"], old_scope_hash, new_scope_hash):
-        return None  # CAS failed, caller retries
-
-    # CAS succeeded — safe to commit version and history
-    scope_ver = repo.get_scope_version(scope["path"])
-    new_scope_ver = scope_ver + 1
-    scope_version_id = HistoryManager.make_scope_version_id(
-        scope["path"], new_scope_ver,
+    # Compute commit_id BEFORE the CAS so the atomic swap can write
+    # both ``scope_hash`` and ``head_commit_id`` in a single DB
+    # statement. This closes a race where a losing pusher could have
+    # later overwritten the winner's head pointer.
+    created_at_iso = datetime.now(timezone.utc).isoformat(timespec="microseconds")
+    new_commit_id = HistoryManager.compute_commit_id(
+        scope_path=scope["path"],
+        scope_hash=new_scope_hash,
+        created_at_iso=created_at_iso,
+        who=auth["agent"],
     )
 
-    new_version = repo.next_global_version()
+    if not repo.cas_update_scope(
+        scope["path"], old_scope_hash, new_scope_hash,
+        head_commit_id=new_commit_id,
+    ):
+        return None
+
     changes = _compute_changeset(scope_prefix, our_files, merged_files)
     merged_changes = _compute_merged_changes(our_files, merged_files, their_files, scope_prefix)
 
     repo.record_history(
-        new_version, auth["agent"], req.snapshots[-1].get("message", ""),
+        new_commit_id, auth["agent"], req.snapshots[-1].get("message", ""),
         scope["path"], changes,
         conflicts=merge_conflicts,
         scope_hash=new_scope_hash,
-        scope_version=scope_version_id,
+        created_at_iso=created_at_iso,
     )
-    repo.set_scope_version(scope["path"], new_scope_ver)
+    repo.set_head_commit_id(new_commit_id)
 
     repo.record_audit("push", auth["agent"], {
         "scope": scope["path"],
         "snapshots": len(req.snapshots),
-        "version": new_version,
-        "scope_version": scope_version_id,
+        "commit_id": new_commit_id,
         "scope_hash": new_scope_hash,
         "merged": bool(merge_conflicts),
         "conflict_count": len(merge_conflicts),
@@ -181,7 +192,7 @@ def _push_cas_attempt(
 
     return PushResponse(
         status="ok",
-        version=new_version,
+        commit_id=new_commit_id,
         pushed=len(req.snapshots),
         root=new_scope_hash,
         merged=bool(merge_conflicts),
@@ -204,10 +215,10 @@ def handle_pull(repo: ServerRepo, auth: dict, body: dict) -> dict:
     scope = auth["_scope"]
     req = PullRequest.from_dict(body)
 
-    latest = repo.get_latest_version()
+    head_commit_id = repo.get_scope_head_commit_id(scope["path"])
 
-    if req.since_version >= latest:
-        return PullResponse(status="up-to-date", version=latest).to_dict()
+    if req.since_commit_id and req.since_commit_id == head_commit_id:
+        return PullResponse(status="up-to-date", head_commit_id=head_commit_id).to_dict()
 
     files_raw = repo.list_scope_files(scope)
     files_b64 = {p: base64.b64encode(d).decode()
@@ -220,32 +231,32 @@ def handle_pull(repo: ServerRepo, auth: dict, body: dict) -> dict:
                    for h in scope_hashes if h not in have_hashes}
 
     MAX_PULL_HISTORY = 200
-    history = repo.get_history_since(req.since_version,
+    history = repo.get_history_since(req.since_commit_id,
                                      scope_path=scope["path"],
                                      limit=MAX_PULL_HISTORY)
 
     repo.record_audit("pull", auth["agent"], {
         "scope": scope["path"],
-        "since": req.since_version,
-        "version": latest,
+        "since_commit_id": req.since_commit_id,
+        "commit_id": head_commit_id,
     })
 
     return PullResponse(
         status="updated",
-        version=latest,
+        head_commit_id=head_commit_id,
         files=files_b64,
         objects=objects_b64,
         history=history,
     ).to_dict()
 
 
-# ── Pull Version ──────────────────────────────
+# ── Pull Commit ────────────────────────────────
 
 def _resolve_scope_tree_hash(repo: ServerRepo, entry: dict,
                              scope_path: str) -> str | None:
     """Resolve the scope-level tree hash from a history entry.
 
-    Prefers scope_hash (new format), falls back to navigating root (legacy).
+    Prefers scope_hash (canonical), falls back to navigating root.
     """
     scope_hash = entry.get("scope_hash", "")
     if scope_hash and repo.store.exists(scope_hash):
@@ -257,26 +268,23 @@ def _resolve_scope_tree_hash(repo: ServerRepo, entry: dict,
     return None
 
 
-def handle_pull_version(repo: ServerRepo, auth: dict, body: dict) -> dict:
-    """Pull files at a specific historical version (not just latest)."""
+def handle_pull_commit(repo: ServerRepo, auth: dict, body: dict) -> dict:
+    """Pull files at a specific historical commit (not just HEAD)."""
     scope = auth["_scope"]
-    req = PullVersionRequest.from_dict(body)
-    target_version = req.version
+    req = PullCommitRequest.from_dict(body)
+    target_commit_id = req.commit_id
 
-    current = repo.get_latest_version()
-    if target_version <= 0 or target_version > current:
-        raise ValueError(
-            f"invalid version {target_version} (current: {current})"
-        )
+    if not target_commit_id:
+        raise ValueError("commit_id is required")
 
-    entry = repo.get_history_entry(target_version)
+    entry = repo.get_history_entry(target_commit_id)
     if not entry:
-        raise ValueError(f"version {target_version} not found")
+        raise ValueError(f"commit {target_commit_id} not found")
 
     subtree_hash = _resolve_scope_tree_hash(repo, entry, scope["path"])
     if subtree_hash is None:
         raise ObjectNotFoundError(
-            f"no tree data for version {target_version}"
+            f"no tree data for commit {target_commit_id}"
         )
 
     files_b64 = {}
@@ -289,26 +297,30 @@ def handle_pull_version(repo: ServerRepo, auth: dict, body: dict) -> dict:
         objects_b64 = {h: base64.b64encode(repo.store.get(h)).decode()
                        for h in reachable}
 
-    repo.record_audit("pull_version", auth["agent"], {
+    repo.record_audit("pull_commit", auth["agent"], {
         "scope": scope["path"],
-        "version": target_version,
+        "commit_id": target_commit_id,
     })
 
     return {
         "status": "ok",
-        "version": target_version,
+        "commit_id": target_commit_id,
         "files": files_b64,
         "objects": objects_b64,
     }
 
 
+# Deprecated alias — old callers expected "pull_version"
+handle_pull_version = handle_pull_commit
+
+
 # ── Rollback ──────────────────────────────────
 
 def handle_rollback(repo: ServerRepo, auth: dict, body: dict) -> dict:
-    """Rollback to a historical version by creating a revert commit.
+    """Rollback to a historical commit by creating a revert commit.
 
-    The version chain continues forward — rollback creates a NEW version
-    whose content equals the target historical version's snapshot.
+    The commit chain continues forward — rollback creates a NEW commit
+    whose content equals the target historical commit's snapshot.
 
     Uses CAS (compare-and-swap) on scope_hash to prevent concurrent
     rollbacks from silently overwriting each other — same safety as push.
@@ -318,38 +330,35 @@ def handle_rollback(repo: ServerRepo, auth: dict, body: dict) -> dict:
         raise PermissionDenied("scope is read-only")
 
     req = RollbackRequest.from_dict(body)
-    target_version = req.target_version
-    current_version = repo.get_latest_version()
+    target_commit_id = req.target_commit_id
+    current_head = repo.get_scope_head_commit_id(scope["path"])
 
-    if target_version <= 0 or target_version > current_version:
-        raise ValueError(
-            f"invalid target version {target_version} "
-            f"(current: {current_version})"
-        )
-    if target_version == current_version:
+    if not target_commit_id:
+        raise ValueError("target_commit_id is required")
+    if target_commit_id == current_head:
         return RollbackResponse(
-            status="already-at-version",
-            new_version=current_version,
-            target_version=target_version,
+            status="already-at-commit",
+            new_commit_id=current_head,
+            target_commit_id=target_commit_id,
         ).to_dict()
 
-    target_entry = repo.get_history_entry(target_version)
+    target_entry = repo.get_history_entry(target_commit_id)
     if not target_entry:
-        raise ValueError(f"version {target_version} not found")
+        raise ValueError(f"commit {target_commit_id} not found")
 
     scope_prefix = normalize_path(scope["path"])
     subtree_hash = _resolve_scope_tree_hash(repo, target_entry, scope["path"])
 
     if subtree_hash is None:
         raise ObjectNotFoundError(
-            f"no tree data for version {target_version}"
+            f"no tree data for commit {target_commit_id}"
         )
 
     target_files = _flatten_tree_to_bytes(repo.store, subtree_hash)
 
     for attempt in range(MAX_CAS_RETRIES + 1):
         result = _rollback_cas_attempt(
-            repo, scope, auth, target_version, target_files,
+            repo, scope, auth, target_commit_id, target_files,
             scope_prefix, attempt,
         )
         if result is not None:
@@ -357,7 +366,7 @@ def handle_rollback(repo: ServerRepo, auth: dict, body: dict) -> dict:
 
     repo.record_audit("rollback_error", auth["agent"], {
         "scope": scope["path"],
-        "target_version": target_version,
+        "target_commit_id": target_commit_id,
         "error": "CAS failed after max retries",
     })
     raise LockError(
@@ -367,10 +376,18 @@ def handle_rollback(repo: ServerRepo, auth: dict, body: dict) -> dict:
 
 def _rollback_cas_attempt(
     repo: ServerRepo, scope: dict, auth: dict,
-    target_version: int, target_files: dict,
+    target_commit_id: str, target_files: dict,
     scope_prefix: str, attempt: int,
 ) -> dict | None:
-    """Single CAS rollback attempt. Returns result dict on success, None on CAS failure."""
+    """Single CAS rollback attempt. Returns result dict on success, None on CAS failure.
+
+    Symmetric with :func:`_push_cas_attempt`: we derive ``new_commit_id``
+    *before* the CAS call so the atomic swap updates ``scope_hash`` and
+    ``head_commit_id`` together.  Skipping this step left a window where
+    a DB-backed ``cas_update_scope`` that always writes ``head_commit_id``
+    could blank out the head between CAS success and the follow-up
+    ``set_scope_head_commit_id`` write.
+    """
     old_scope_hash = repo.get_scope_hash(scope["path"])
     current_files = repo.list_scope_files(scope)
     changes = _compute_changeset(scope_prefix, current_files, target_files)
@@ -378,38 +395,41 @@ def _rollback_cas_attempt(
     _apply_merged_files(repo, scope, current_files, target_files)
     new_scope_hash = repo.build_scope_tree(scope)
 
-    if not repo.cas_update_scope(scope["path"], old_scope_hash, new_scope_hash):
+    created_at_iso = datetime.now(timezone.utc).isoformat(timespec="microseconds")
+    new_commit_id = HistoryManager.compute_commit_id(
+        scope_path=scope["path"],
+        scope_hash=new_scope_hash,
+        created_at_iso=created_at_iso,
+        who=auth["agent"],
+    )
+
+    if not repo.cas_update_scope(
+        scope["path"], old_scope_hash, new_scope_hash,
+        head_commit_id=new_commit_id,
+    ):
         return None
 
-    scope_ver = repo.get_scope_version(scope["path"])
-    new_scope_ver = scope_ver + 1
-    scope_version_id = HistoryManager.make_scope_version_id(
-        scope["path"], new_scope_ver,
-    )
-    new_version = repo.next_global_version()
-
     repo.record_history(
-        new_version, auth["agent"],
-        f"rollback to v{target_version}",
+        new_commit_id, auth["agent"],
+        f"rollback to #{target_commit_id[:8]}",
         scope["path"], changes,
         scope_hash=new_scope_hash,
-        scope_version=scope_version_id,
+        created_at_iso=created_at_iso,
     )
-    repo.set_scope_version(scope["path"], new_scope_ver)
+    repo.set_head_commit_id(new_commit_id)
 
     repo.record_audit("rollback", auth["agent"], {
         "scope": scope["path"],
-        "target_version": target_version,
-        "new_version": new_version,
-        "scope_version": scope_version_id,
+        "target_commit_id": target_commit_id,
+        "new_commit_id": new_commit_id,
         "scope_hash": new_scope_hash,
         "cas_attempts": attempt + 1,
     })
 
     return RollbackResponse(
         status="rolled-back",
-        new_version=new_version,
-        target_version=target_version,
+        new_commit_id=new_commit_id,
+        target_commit_id=target_commit_id,
         root=new_scope_hash,
         changes=changes,
     ).to_dict()
@@ -433,10 +453,11 @@ def _validate_scope_paths(scope: dict, scope_prefix: str,
     return rejected
 
 
-def _resolve_conflicts(repo, scope, base_version, current_version,
+def _resolve_conflicts(repo, scope, base_commit_id, current_head_commit,
                        our_files, their_files):
-    if base_version < current_version:
-        base_files = _get_base_files(repo, scope, base_version)
+    """Three-way merge iff the client's base diverges from server head."""
+    if base_commit_id and current_head_commit and base_commit_id != current_head_commit:
+        base_files = _get_base_files(repo, scope, base_commit_id)
         return merge_file_sets(base_files, our_files, their_files)
     return their_files, []
 
@@ -466,7 +487,7 @@ def _compute_changeset(scope_prefix, old_files, merged_files):
 
 def _compute_merged_changes(our_files, merged_files, their_files, scope_prefix):
     """Compute files that were merged from server state but not in client's push.
-    
+
     These are files the client needs to know about to keep its local state in sync.
     """
     merged_changes = []
@@ -499,21 +520,16 @@ def _navigate_tree(store, tree_hash, parts):
     return _navigate_tree(store, h, parts[1:])
 
 
-def _get_base_files(repo, scope, base_version):
-    """Get scope files at a historical version for three-way merge base.
-
-    Uses scope_hash directly when available, falls back to legacy root hash.
-    """
-    entry = repo.get_history_entry(base_version)
+def _get_base_files(repo, scope, base_commit_id):
+    """Get scope files at a historical commit for three-way merge base."""
+    entry = repo.get_history_entry(base_commit_id)
     if not entry:
         return {}
     try:
-        # Prefer scope_hash (new per-scope versioning)
         scope_hash = entry.get("scope_hash", "")
         if scope_hash and repo.store.exists(scope_hash):
             return _flatten_tree_to_bytes(repo.store, scope_hash)
 
-        # Fallback: legacy root hash + tree navigation
         root = entry.get("root", "")
         if root and repo.store.exists(root):
             scope_prefix = normalize_path(scope["path"])
@@ -523,8 +539,8 @@ def _get_base_files(repo, scope, base_version):
                 return _flatten_tree_to_bytes(repo.store, subtree_hash)
     except (KeyError, json.JSONDecodeError) as exc:
         print(f"[mut-server] warning: failed to read base "
-              f"v{base_version}: {exc}")
+              f"#{base_commit_id[:8]}: {exc}")
     except ObjectNotFoundError as exc:
         print(f"[mut-server] warning: missing object for base "
-              f"v{base_version}: {exc}")
+              f"#{base_commit_id[:8]}: {exc}")
     return {}

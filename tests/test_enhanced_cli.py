@@ -51,11 +51,10 @@ class TestMutStatus:
         config["server"] = "https://api.puppyone.com/mut/ap_test123"
         save_config(repo.mut_root, config)
 
-        # Write REMOTE_HEAD
-        write_text(repo.mut_root / REMOTE_HEAD_FILE, "5")
+        # Write REMOTE_HEAD (now a hash-based commit id, not an int)
+        write_text(repo.mut_root / REMOTE_HEAD_FILE, "a1b2c3d4e5f60718")
 
         # Run cmd_status in the workspace directory
-        import os
         monkeypatch.chdir(workspace)
 
         from mut.cli import cmd_status
@@ -64,7 +63,8 @@ class TestMutStatus:
 
         captured = capsys.readouterr()
         assert "api.puppyone.com" in captured.out
-        assert "remote version: 5" in captured.out
+        # cli truncates commit ids to 8 hex chars for display
+        assert "remote commit: a1b2c3d4" in captured.out
 
     def test_status_shows_unpushed_count(self, workspace):
         repo = MutRepo(str(workspace))

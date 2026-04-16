@@ -53,7 +53,7 @@ def link_access(
         credential_override: Explicit credential (overrides URL extraction).
 
     Returns:
-        dict with status info: server_version, scope_created, etc.
+        dict with status info: server_commit_id, scope_created, etc.
     """
     credential = credential_override or _extract_credential(access_point_url)
     client = MutClient(access_point_url, credential)
@@ -64,7 +64,7 @@ def link_access(
     except Exception as e:
         raise MutError(f"Cannot connect to server: {e}") from e
 
-    server_version = clone_resp.get("version", 0)
+    server_commit_id = clone_resp.get("head_commit_id", "")
 
     # 2. Update config
     save_config(repo.mut_root, {
@@ -80,12 +80,12 @@ def link_access(
     # 4. Write REMOTE_HEAD
     from mut.foundation.config import REMOTE_HEAD_FILE
     from mut.foundation.fs import write_text
-    write_text(repo.mut_root / REMOTE_HEAD_FILE, str(server_version))
+    write_text(repo.mut_root / REMOTE_HEAD_FILE, server_commit_id)
 
     result = {
         "status": "linked",
         "server": access_point_url,
-        "server_version": server_version,
+        "server_commit_id": server_commit_id,
         "scope_created": False,
     }
 
@@ -123,7 +123,7 @@ def link_access(
         # Push to server
         try:
             push_resp = client.push(
-                base_version=server_version,
+                base_commit_id=server_commit_id,
                 snapshots=[{
                     "id": 1,
                     "root": root_hash,
@@ -134,7 +134,9 @@ def link_access(
                 objects=objects,
             )
             result["scope_created"] = True
-            result["server_version"] = push_resp.get("version", server_version + 1)
+            result["server_commit_id"] = push_resp.get(
+                "commit_id", server_commit_id,
+            )
         except Exception as e:
             # Push may fail if server already has content — that's OK
             result["scope_push_error"] = str(e)

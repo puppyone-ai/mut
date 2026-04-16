@@ -45,7 +45,12 @@ from mut.server.sync_queue import ScopeQueue
 
 
 class ServerRepo:
-    """Manages a server-side Mut repository (protocol state only, no auth)."""
+    """Manages a server-side Mut repository (protocol state only, no auth).
+
+    Commits are identified by commit_id (16-hex-char SHA256 hash).
+    Per-scope head_commit_id is the canonical CAS target — there is no
+    global sequential version counter.
+    """
 
     def __init__(self, repo_root: str):
         self.root = Path(repo_root).resolve()
@@ -59,20 +64,6 @@ class ServerRepo:
         self.locks_dir = self.meta / SERVER_LOCKS_DIR
 
         self._scope_queue = ScopeQueue()
-        self._version_counter: int | None = None  # lazy-loaded in-memory counter
-
-    def next_global_version(self) -> int:
-        """Atomically increment and return the next global version number.
-
-        Uses an in-memory counter (no await between read+write) so it's
-        safe within asyncio's single-threaded event loop even when
-        sibling scopes run in parallel.
-        """
-        if self._version_counter is None:
-            self._version_counter = self.history.get_latest_version()
-        self._version_counter += 1
-        self.history.set_latest_version(self._version_counter)
-        return self._version_counter
 
     # ── Init ──────────────────────────────────────
 
@@ -91,7 +82,7 @@ class ServerRepo:
         mkdir_p(meta / SERVER_AUDIT_DIR)
 
         write_json(meta / SERVER_CONFIG_FILE, {"project": project_name})
-        write_text(meta / SERVER_HISTORY_DIR / SERVER_LATEST_FILE, "0")
+        write_text(meta / SERVER_HISTORY_DIR / SERVER_LATEST_FILE, "")
         write_text(meta / SERVER_HISTORY_DIR / SERVER_ROOT_FILE, "")
 
         return ServerRepo(repo_root)
@@ -114,11 +105,11 @@ class ServerRepo:
 
     # ── Delegated history access ──────────────────
 
-    def get_latest_version(self) -> int:
-        return self.history.get_latest_version()
+    def get_head_commit_id(self) -> str:
+        return self.history.get_head_commit_id()
 
-    def set_latest_version(self, version: int):
-        self.history.set_latest_version(version)
+    def set_head_commit_id(self, cid: str):
+        self.history.set_head_commit_id(cid)
 
     # Deprecated: use scope-level hash instead
     def get_root_hash(self) -> str:
@@ -127,12 +118,12 @@ class ServerRepo:
     def set_root_hash(self, h: str):
         self.history.set_root_hash(h)
 
-    # Per-scope version + hash
-    def get_scope_version(self, scope_path: str) -> int:
-        return self.history.get_scope_version(scope_path)
+    # Per-scope head + hash
+    def get_scope_head_commit_id(self, scope_path: str) -> str:
+        return self.history.get_scope_head_commit_id(scope_path)
 
-    def set_scope_version(self, scope_path: str, version: int):
-        self.history.set_scope_version(scope_path, version)
+    def set_scope_head_commit_id(self, scope_path: str, cid: str):
+        self.history.set_scope_head_commit_id(scope_path, cid)
 
     def get_scope_hash(self, scope_path: str) -> str:
         return self.history.get_scope_hash(scope_path)
@@ -140,28 +131,29 @@ class ServerRepo:
     def set_scope_hash(self, scope_path: str, h: str):
         self.history.set_scope_hash(scope_path, h)
 
-    def record_history(self, version: int, who: str, message: str,
+    def record_history(self, commit_id: str, who: str, message: str,
                        scope_path: str, changes: list,
                        conflicts: list | None = None,
-                       scope_hash: str = "", scope_version: str = "",
-                       root_hash: str = ""):
-        self.history.record(version, who, message, scope_path, changes,
-                            conflicts, scope_hash, scope_version, root_hash)
+                       scope_hash: str = "",
+                       root_hash: str = "",
+                       created_at_iso: str = ""):
+        self.history.record(commit_id, who, message, scope_path, changes,
+                            conflicts, scope_hash, root_hash, created_at_iso)
 
-    def get_history_since(self, since_version: int,
+    def get_history_since(self, since_commit_id: str,
                           scope_path: str | None = None,
                           limit: int = 0) -> list:
-        return self.history.get_since(since_version, scope_path, limit=limit)
+        return self.history.get_since(since_commit_id, scope_path, limit=limit)
 
-    def get_history_entry(self, version: int) -> dict | None:
-        return self.history.get_entry(version)
+    def get_history_entry(self, commit_id: str) -> dict | None:
+        return self.history.get_entry(commit_id)
 
     # Async delegations
-    async def async_get_latest_version(self) -> int:
-        return await self.history.async_get_latest_version()
+    async def async_get_head_commit_id(self) -> str:
+        return await self.history.async_get_head_commit_id()
 
-    async def async_set_latest_version(self, version: int):
-        await self.history.async_set_latest_version(version)
+    async def async_set_head_commit_id(self, cid: str):
+        await self.history.async_set_head_commit_id(cid)
 
     async def async_get_root_hash(self) -> str:
         return await self.history.async_get_root_hash()
@@ -169,29 +161,30 @@ class ServerRepo:
     async def async_set_root_hash(self, h: str):
         await self.history.async_set_root_hash(h)
 
-    async def async_get_scope_version(self, scope_path: str) -> int:
-        return await self.history.async_get_scope_version(scope_path)
+    async def async_get_scope_head_commit_id(self, scope_path: str) -> str:
+        return await self.history.async_get_scope_head_commit_id(scope_path)
 
     async def async_get_scope_hash(self, scope_path: str) -> str:
         return await self.history.async_get_scope_hash(scope_path)
 
-    async def async_record_history(self, version: int, who: str, message: str,
+    async def async_record_history(self, commit_id: str, who: str, message: str,
                                    scope_path: str, changes: list,
                                    conflicts: list = None,
-                                   scope_hash: str = "", scope_version: str = "",
-                                   root_hash: str = ""):
-        await self.history.async_record(version, who, message, scope_path,
+                                   scope_hash: str = "",
+                                   root_hash: str = "",
+                                   created_at_iso: str = ""):
+        await self.history.async_record(commit_id, who, message, scope_path,
                                         changes, conflicts, scope_hash,
-                                        scope_version, root_hash)
+                                        root_hash, created_at_iso)
 
-    async def async_get_history_since(self, since_version: int,
+    async def async_get_history_since(self, since_commit_id: str,
                                       scope_path: str = None,
                                       limit: int = 0) -> list:
-        return await self.history.async_get_since(since_version, scope_path,
+        return await self.history.async_get_since(since_commit_id, scope_path,
                                                   limit=limit)
 
-    async def async_get_history_entry(self, version: int) -> dict | None:
-        return await self.history.async_get_entry(version)
+    async def async_get_history_entry(self, commit_id: str) -> dict | None:
+        return await self.history.async_get_entry(commit_id)
 
     # ── Delegated audit access ────────────────────
 
@@ -347,16 +340,22 @@ class ServerRepo:
     def release_lock(self, scope_id: str):
         lock_release(self.locks_dir / f"{scope_id}.lock")
 
-    def cas_update_scope(self, scope_path: str, old_hash: str, new_hash: str) -> bool:
-        """CAS update scope hash. Returns True if old_hash matched and update succeeded.
-        
-        Default implementation uses file-based scope state (suitable for single-process).
-        PuppyOne overrides this with a database CAS (UPDATE ... WHERE scope_hash = old_hash).
+    def cas_update_scope(self, scope_path: str, old_hash: str,
+                         new_hash: str, head_commit_id: str = "") -> bool:
+        """Atomic CAS on (scope_hash, head_commit_id).
+
+        The default (filesystem) implementation is single-process so it
+        can safely do two sequential writes. Multi-process backends
+        (e.g. PuppyOne + Postgres) override this and push both fields
+        into the same UPDATE statement so a losing CAS cannot later
+        overwrite the winner's head pointer.
         """
         current = self.get_scope_hash(scope_path)
         if current != old_hash:
             return False
         self.set_scope_hash(scope_path, new_hash)
+        if head_commit_id:
+            self.set_scope_head_commit_id(scope_path, head_commit_id)
         return True
 
 

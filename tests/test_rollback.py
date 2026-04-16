@@ -1,4 +1,4 @@
-"""Tests for rollback mechanism — revert commit via handlers."""
+"""Tests for rollback mechanism — revert via commit_id."""
 
 import asyncio
 import base64
@@ -8,6 +8,9 @@ import pytest
 from mut.server.repo import ServerRepo
 from mut.server.server import _handle_push, _handle_rollback, _handle_clone
 from mut.server.handlers import handle_rollback
+
+
+_SEED = "seedseedseedseed"
 
 
 def _run(coro):
@@ -23,7 +26,9 @@ def server_repo(tmp_path):
     repo = ServerRepo.init(str(tmp_path / "server"), project_name="test-proj")
     root = repo.build_full_tree()
     repo.set_root_hash(root)
-    repo.record_history(0, "server", "initial state", "/", [], root_hash=root)
+    repo.record_history(_SEED, "server", "initial state", "/", [],
+                        root_hash=root)
+    repo.set_head_commit_id(_SEED)
     return repo
 
 
@@ -40,10 +45,10 @@ def auth(rw_scope):
     return {"agent": "agent-A", "_scope": rw_scope}
 
 
-def _make_push_body(repo, files: dict, base_version: int = 0) -> dict:
+def _make_push_body(repo, files: dict, base_commit_id: str = "") -> dict:
     from mut.core import tree as tree_mod
 
-    nested = {}
+    nested: dict = {}
     for path, content in files.items():
         parts = path.split("/")
         d = nested
@@ -67,7 +72,7 @@ def _make_push_body(repo, files: dict, base_version: int = 0) -> dict:
     objects_b64 = {h: base64.b64encode(repo.store.get(h)).decode()
                    for h in reachable}
     return {
-        "base_version": base_version,
+        "base_commit_id": base_commit_id,
         "snapshots": [{"id": 1, "root": root_hash, "message": "push",
                        "who": "agent-A", "time": ""}],
         "objects": objects_b64,
@@ -77,51 +82,51 @@ def _make_push_body(repo, files: dict, base_version: int = 0) -> dict:
 class TestRollbackSync:
     """Test sync rollback handler."""
 
-    def test_rollback_to_v1(self, server_repo, auth):
-        # Push v1: file-a.txt
+    def test_rollback_to_earlier_commit(self, server_repo, auth):
         body1 = _make_push_body(server_repo, {"file-a.txt": b"version1"})
-        result1 = _run(_handle_push(server_repo, auth, body1))
-        assert result1["version"] == 1
+        r1 = _run(_handle_push(server_repo, auth, body1))
+        cid1 = r1["commit_id"]
 
-        # Push v2: file-a.txt updated
-        body2 = _make_push_body(server_repo, {"file-a.txt": b"version2"}, base_version=1)
-        result2 = _run(_handle_push(server_repo, auth, body2))
-        assert result2["version"] == 2
+        body2 = _make_push_body(server_repo, {"file-a.txt": b"version2"},
+                                base_commit_id=cid1)
+        r2 = _run(_handle_push(server_repo, auth, body2))
+        cid2 = r2["commit_id"]
+        assert cid1 != cid2
 
-        # Rollback to v1
-        rb_result = handle_rollback(server_repo, auth, {"target_version": 1})
-        assert rb_result["status"] == "rolled-back"
-        assert rb_result["new_version"] == 3
-        assert rb_result["target_version"] == 1
+        rb = handle_rollback(server_repo, auth,
+                             {"target_commit_id": cid1})
+        assert rb["status"] == "rolled-back"
+        assert rb["target_commit_id"] == cid1
+        assert rb["new_commit_id"]  # rollback creates a forward commit
+        assert rb["new_commit_id"] != cid1
+        assert rb["new_commit_id"] != cid2
 
-        # Verify the file content is back to v1
         scope = auth["_scope"]
         files = server_repo.list_scope_files(scope)
         assert files.get("file-a.txt") == b"version1"
 
-        # Version chain is v0→v1→v2→v3(rollback)
-        assert server_repo.get_latest_version() == 3
+    def test_rollback_already_at_commit(self, server_repo, auth):
+        body = _make_push_body(server_repo, {"x.txt": b"data"})
+        r = _run(_handle_push(server_repo, auth, body))
 
-    def test_rollback_already_at_version(self, server_repo, auth):
+        result = handle_rollback(server_repo, auth,
+                                 {"target_commit_id": r["commit_id"]})
+        assert result["status"] == "already-at-commit"
+
+    def test_rollback_missing_target_raises(self, server_repo, auth):
         body = _make_push_body(server_repo, {"x.txt": b"data"})
         _run(_handle_push(server_repo, auth, body))
 
-        result = handle_rollback(server_repo, auth, {"target_version": 1})
-        assert result["status"] == "already-at-version"
+        with pytest.raises(ValueError):
+            handle_rollback(server_repo, auth, {"target_commit_id": ""})
 
-    def test_rollback_invalid_version_zero(self, server_repo, auth):
+    def test_rollback_unknown_commit(self, server_repo, auth):
         body = _make_push_body(server_repo, {"x.txt": b"data"})
         _run(_handle_push(server_repo, auth, body))
 
-        with pytest.raises(ValueError, match="invalid target version"):
-            handle_rollback(server_repo, auth, {"target_version": 0})
-
-    def test_rollback_future_version(self, server_repo, auth):
-        body = _make_push_body(server_repo, {"x.txt": b"data"})
-        _run(_handle_push(server_repo, auth, body))
-
-        with pytest.raises(ValueError, match="invalid target version"):
-            handle_rollback(server_repo, auth, {"target_version": 999})
+        with pytest.raises(ValueError):
+            handle_rollback(server_repo, auth,
+                            {"target_commit_id": "deadbeefdeadbeef"})
 
     def test_rollback_readonly_rejected(self, server_repo):
         server_repo.add_scope("scope-ro", "/")
@@ -131,22 +136,27 @@ class TestRollbackSync:
 
         from mut.foundation.error import PermissionDenied
         with pytest.raises(PermissionDenied):
-            handle_rollback(server_repo, auth, {"target_version": 1})
+            handle_rollback(server_repo, auth,
+                            {"target_commit_id": "abcdef1234567890"})
 
     def test_rollback_preserves_history(self, server_repo, auth):
-        """All versions remain in history after rollback."""
+        """All prior commits remain in history after rollback."""
         body1 = _make_push_body(server_repo, {"a.txt": b"v1"})
-        _run(_handle_push(server_repo, auth, body1))
-        body2 = _make_push_body(server_repo, {"a.txt": b"v2"}, base_version=1)
-        _run(_handle_push(server_repo, auth, body2))
+        r1 = _run(_handle_push(server_repo, auth, body1))
+        body2 = _make_push_body(server_repo, {"a.txt": b"v2"},
+                                base_commit_id=r1["commit_id"])
+        r2 = _run(_handle_push(server_repo, auth, body2))
 
-        handle_rollback(server_repo, auth, {"target_version": 1})
+        rb = handle_rollback(server_repo, auth,
+                             {"target_commit_id": r1["commit_id"]})
 
-        # All 4 entries exist: v0 (init), v1, v2, v3 (rollback)
-        for v in range(4):
-            entry = server_repo.get_history_entry(v)
-            assert entry is not None
-        assert "rollback" in server_repo.get_history_entry(3)["message"]
+        for cid in (_SEED, r1["commit_id"], r2["commit_id"], rb["new_commit_id"]):
+            entry = server_repo.get_history_entry(cid)
+            assert entry is not None, f"missing commit {cid}"
+
+        assert "rollback" in server_repo.get_history_entry(
+            rb["new_commit_id"]
+        )["message"]
 
 
 class TestRollbackAsync:
@@ -154,16 +164,18 @@ class TestRollbackAsync:
 
     def test_async_rollback(self, server_repo, auth):
         body = _make_push_body(server_repo, {"doc.md": b"# Hello"})
-        _run(_handle_push(server_repo, auth, body))
+        r1 = _run(_handle_push(server_repo, auth, body))
 
-        body2 = _make_push_body(server_repo, {"doc.md": b"# Updated"}, base_version=1)
+        body2 = _make_push_body(server_repo, {"doc.md": b"# Updated"},
+                                base_commit_id=r1["commit_id"])
         _run(_handle_push(server_repo, auth, body2))
 
-        result = _run(_handle_rollback(server_repo, auth, {"target_version": 1}))
+        result = _run(_handle_rollback(server_repo, auth,
+                                       {"target_commit_id": r1["commit_id"]}))
         assert result["status"] == "rolled-back"
-        assert result["new_version"] == 3
+        assert result["target_commit_id"] == r1["commit_id"]
+        assert result["new_commit_id"]  # rollback creates a forward commit
 
-        # Verify via clone
         clone_result = _run(_handle_clone(server_repo, auth, {}))
         content = base64.b64decode(clone_result["files"]["doc.md"])
         assert content == b"# Hello"

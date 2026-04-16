@@ -26,7 +26,7 @@ def clone(server_url: str, credential: str, workdir: str = None) -> MutRepo:
 
     files_b64 = resp["files"]
     objects_b64 = resp["objects"]
-    version = resp["version"]
+    head_commit_id = resp.get("head_commit_id", "")
     project_name = resp.get("project", "project")
 
     if workdir is None:
@@ -82,6 +82,6 @@ def clone(server_url: str, credential: str, workdir: str = None) -> MutRepo:
     manifest_mod.save(mut, new_manifest)
 
     write_text(mut / HEAD_FILE, "1")
-    write_text(mut / REMOTE_HEAD_FILE, str(version))
+    write_text(mut / REMOTE_HEAD_FILE, head_commit_id)
 
     return repo

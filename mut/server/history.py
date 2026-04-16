@@ -1,16 +1,17 @@
 """Server-side version history management with pluggable backends.
 
-Supports per-scope versioning (scope_hash, scope_version) alongside
-a global version counter. No global root hash — each scope tracks
-its own Merkle tree hash independently.
+Commits are identified by a 16-hex-char commit_id (SHA256 truncated)
+derived from (scope_path, scope_hash, created_at_iso, who). Per-scope
+head_commit_id tracking is the canonical state used by CAS.
 
-Conflict records persist lost_content and lost_hash fields
-for full auditability and recovery of overwritten content.
+Conflict records persist lost_content and lost_hash fields for full
+auditability and recovery of overwritten content.
 """
 
 from __future__ import annotations
 
 import abc
+import hashlib
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -18,97 +19,163 @@ from mut.foundation.config import normalize_path
 from mut.foundation.fs import read_json, write_json, write_text
 
 
+# ── Commit ID algorithm ────────────────────────
+
+COMMIT_ID_LENGTH = 16  # hex chars = 64 bits; collision probability ~1/2^64 per scope
+
+
+def compute_commit_id(
+    scope_path: str,
+    scope_hash: str,
+    created_at_iso: str,
+    who: str,
+) -> str:
+    """Deterministic commit_id from commit-identifying metadata.
+
+    Payload: scope_path | scope_hash | created_at_iso | who
+
+    - scope_path gives per-scope uniqueness
+    - scope_hash fingerprints the content (Merkle root)
+    - created_at_iso disambiguates same-content rollbacks
+    - who disambiguates same-time commits from different agents
+
+    We intentionally exclude `message` (purely cosmetic) and
+    `parent_commit_id` (not persisted; linear chain uses created_at
+    sorting). Future DAG support can rebuild a chain without touching
+    the id algorithm.
+    """
+    payload = "|".join([
+        scope_path or "",
+        scope_hash or "",
+        created_at_iso,
+        who or "",
+    ])
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:COMMIT_ID_LENGTH]
+
+
 class HistoryBackend(abc.ABC):
-    """Abstract interface for version history storage."""
+    """Abstract interface for commit history storage."""
+
+    # Global HEAD (most recent commit across all scopes — used for audit
+    # display and clone response; NOT used for CAS, which is per-scope)
+    @abc.abstractmethod
+    def get_head_commit_id(self) -> str: ...
 
     @abc.abstractmethod
-    def get_latest_version(self) -> int: ...
+    def set_head_commit_id(self, cid: str) -> None: ...
+
+    # Commit records
+    @abc.abstractmethod
+    def record(self, entry: dict) -> None:
+        """Persist a commit entry. Entry MUST contain 'commit_id' key."""
 
     @abc.abstractmethod
-    def set_latest_version(self, version: int) -> None: ...
+    def get_entry(self, commit_id: str) -> dict | None: ...
 
     @abc.abstractmethod
-    def record(self, version: int, entry: dict) -> None: ...
+    def get_since(self, since_commit_id: str,
+                  limit: int = 0) -> list[dict]:
+        """Return commits strictly after since_commit_id in linear order.
 
-    @abc.abstractmethod
-    def get_entry(self, version: int) -> dict | None: ...
+        When since_commit_id is empty, return all commits from the root.
+        Ordering is by (created_at ASC, commit_id ASC) — commit_id acts
+        as a tie-breaker for same-timestamp commits.
+        """
 
-    @abc.abstractmethod
-    def get_since(self, since_version: int, limit: int = 0) -> list[dict]: ...
+    # Per-scope head (canonical CAS target; required, not optional)
+    def get_scope_head_commit_id(self, _scope_path: str) -> str:
+        return ""
 
-    # Per-scope version tracking (default no-ops for backends that
-    # don't support scope-level versioning, e.g. legacy or in-memory)
-    def get_scope_version(self, _scope_path: str) -> int:
-        """Get the latest scope-level version number for a scope."""
-        return 0
+    def set_scope_head_commit_id(self, _scope_path: str, _cid: str) -> None:
+        ...
 
-    def set_scope_version(self, _scope_path: str, _version: int) -> None:
-        """Set the scope-level version number. Override in subclass."""
-
+    # Per-scope Merkle root hash (canonical content fingerprint; used
+    # alongside head_commit_id for CAS on the content side)
     def get_scope_hash(self, _scope_path: str) -> str:
-        """Get the current Merkle tree hash for a scope."""
         return ""
 
     def set_scope_hash(self, _scope_path: str, _h: str) -> None:
-        """Set the Merkle tree hash for a scope. Override in subclass."""
+        ...
 
-    def get_version_index(self) -> dict:
-        """Get the global version -> scope version mapping."""
-        return {}
-
-    def update_version_index(self, _global_version: int,
-                             _scope: str, _scope_version: str) -> None:
-        """Record a global version -> scope version mapping. Override in subclass."""
-
-    # Backwards compat: root hash (deprecated, kept for migration)
+    # Global Merkle root (optional — only used by legacy root-hash-based
+    # clone paths; scope-level storage has superseded it)
     def get_root_hash(self) -> str:
-        """Deprecated: use get_scope_hash instead."""
         return ""
 
     def set_root_hash(self, _h: str) -> None:
-        """Deprecated: use set_scope_hash instead."""
+        ...
 
 
 class FileSystemHistoryBackend(HistoryBackend):
-    """JSON files in .mut-server/history/."""
+    """JSON files in .mut-server/history/.
+
+    Layout:
+      latest                      -- head_commit_id (string)
+      root                        -- global Merkle root (legacy)
+      commits/{commit_id}.json    -- per-commit records
+      scope_state/{scope}.json    -- {"head_commit_id": "...", "hash": "..."}
+    """
 
     LATEST_FILE = "latest"
     ROOT_FILE = "root"
-    VERSION_INDEX_FILE = "versions.json"
+    COMMITS_DIR = "commits"
     SCOPE_STATE_DIR = "scope_state"
 
     def __init__(self, history_dir: Path):
         self.dir = history_dir
 
-    def get_latest_version(self) -> int:
+    def get_head_commit_id(self) -> str:
         f = self.dir / self.LATEST_FILE
         if not f.exists():
-            return 0
-        return int(f.read_text().strip())
+            return ""
+        return f.read_text().strip()
 
-    def set_latest_version(self, version: int) -> None:
-        write_text(self.dir / self.LATEST_FILE, str(version))
+    def set_head_commit_id(self, cid: str) -> None:
+        write_text(self.dir / self.LATEST_FILE, cid)
 
-    def record(self, version: int, entry: dict) -> None:
-        write_json(self.dir / f"{version:06d}.json", entry)
+    def _commit_path(self, commit_id: str) -> Path:
+        d = self.dir / self.COMMITS_DIR
+        d.mkdir(parents=True, exist_ok=True)
+        return d / f"{commit_id}.json"
 
-    def get_entry(self, version: int) -> dict | None:
-        path = self.dir / f"{version:06d}.json"
+    def record(self, entry: dict) -> None:
+        commit_id = entry.get("commit_id")
+        if not commit_id:
+            raise ValueError("history entry missing commit_id")
+        write_json(self._commit_path(commit_id), entry)
+
+    def get_entry(self, commit_id: str) -> dict | None:
+        path = self._commit_path(commit_id)
         if path.exists():
             return read_json(path)
         return None
 
-    def get_since(self, since_version: int, limit: int = 0) -> list[dict]:
-        latest = self.get_latest_version()
-        start = since_version + 1
+    def get_since(self, since_commit_id: str,
+                  limit: int = 0) -> list[dict]:
+        commits_dir = self.dir / self.COMMITS_DIR
+        if not commits_dir.exists():
+            return []
+
+        entries: list[dict] = []
+        for p in commits_dir.glob("*.json"):
+            entry = read_json(p)
+            if entry:
+                entries.append(entry)
+
+        entries.sort(key=lambda e: (e.get("time", ""), e.get("commit_id", "")))
+
+        if since_commit_id:
+            since_entry = self.get_entry(since_commit_id)
+            if since_entry is None:
+                return []
+            since_key = (since_entry.get("time", ""),
+                         since_entry.get("commit_id", ""))
+            entries = [e for e in entries
+                       if (e.get("time", ""), e.get("commit_id", "")) > since_key]
+
         if limit > 0:
-            start = max(start, latest - limit + 1)
-        result = []
-        for v in range(start, latest + 1):
-            entry = self.get_entry(v)
-            if entry is not None:
-                result.append(entry)
-        return result
+            entries = entries[-limit:]
+        return entries
 
     # Per-scope state stored in scope_state/{scope_key}.json
     def _scope_key(self, scope_path: str) -> str:
@@ -124,17 +191,17 @@ class FileSystemHistoryBackend(HistoryBackend):
         p = self._scope_state_path(scope_path)
         if p.exists():
             return read_json(p)
-        return {"version": 0, "hash": ""}
+        return {"head_commit_id": "", "hash": ""}
 
     def _save_scope_state(self, scope_path: str, state: dict) -> None:
         write_json(self._scope_state_path(scope_path), state)
 
-    def get_scope_version(self, scope_path: str) -> int:
-        return self._load_scope_state(scope_path).get("version", 0)
+    def get_scope_head_commit_id(self, scope_path: str) -> str:
+        return self._load_scope_state(scope_path).get("head_commit_id", "")
 
-    def set_scope_version(self, scope_path: str, version: int) -> None:
+    def set_scope_head_commit_id(self, scope_path: str, cid: str) -> None:
         state = self._load_scope_state(scope_path)
-        state["version"] = version
+        state["head_commit_id"] = cid
         self._save_scope_state(scope_path, state)
 
     def get_scope_hash(self, scope_path: str) -> str:
@@ -145,26 +212,6 @@ class FileSystemHistoryBackend(HistoryBackend):
         state["hash"] = h
         self._save_scope_state(scope_path, state)
 
-    def get_version_index(self) -> dict:
-        """Reconstruct version index from history entries (no separate file)."""
-        latest = self.get_latest_version()
-        index = {}
-        for v in range(0, latest + 1):
-            entry = self.get_entry(v)
-            if entry:
-                index[str(v)] = {
-                    "scope": entry.get("scope", "/"),
-                    "scope_version": entry.get("scope_version", ""),
-                }
-        return index
-
-    def update_version_index(self, _global_version: int,
-                             _scope: str, _scope_version: str) -> None:
-        # Version index is derived from history entries — no separate file needed.
-        # The entry itself (recorded via record()) contains scope + scope_version.
-        pass
-
-    # Backwards compat
     def get_root_hash(self) -> str:
         root_file = self.dir / self.ROOT_FILE
         if not root_file.exists():
@@ -176,15 +223,23 @@ class FileSystemHistoryBackend(HistoryBackend):
 
 
 class HistoryManager:
-    """Manages version history via a pluggable HistoryBackend.
+    """Manages commit history via a pluggable HistoryBackend.
 
-    Supports per-scope versioning: each scope has independent version
-    numbers (e.g. "docs/3", "src/5") and tree hashes. A global version
-    counter provides cross-scope ordering.
+    Each commit is identified by a 16-hex-char commit_id. Per-scope
+    head_commit_id and scope_hash are the canonical CAS targets.
     """
 
     def __init__(self, backend: HistoryBackend):
         self._backend = backend
+
+    # ── Commit ID ─────────────────────────────
+
+    @staticmethod
+    def compute_commit_id(scope_path: str, scope_hash: str,
+                          created_at_iso: str, who: str) -> str:
+        return compute_commit_id(scope_path, scope_hash, created_at_iso, who)
+
+    # ── Entry construction ────────────────────
 
     @staticmethod
     def _serialize_conflicts(conflicts: list) -> list:
@@ -194,49 +249,44 @@ class HistoryManager:
             for c in conflicts
         ]
 
-    @staticmethod
-    def make_scope_version_id(scope_path: str, scope_version: int) -> str:
-        """Create a scope-prefixed version identifier like 'docs/3'."""
-        norm = normalize_path(scope_path)
-        prefix = norm if norm else "root"
-        return f"{prefix}/{scope_version}"
-
-    def _make_entry(self, global_version: int, who: str, message: str,
+    def _make_entry(self, commit_id: str, who: str, message: str,
                     scope_path: str, changes: list,
                     conflicts: list | None = None,
                     scope_hash: str = "",
-                    scope_version: str = "",
-                    root_hash: str = "") -> dict:
+                    root_hash: str = "",
+                    created_at_iso: str = "") -> dict:
+        if not created_at_iso:
+            created_at_iso = datetime.now(timezone.utc).isoformat(timespec="microseconds")
         entry: dict = {
-            "id": global_version,
-            "scope_version": scope_version,
+            "commit_id": commit_id,
             "who": who,
-            "time": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "time": created_at_iso,
             "message": message,
             "scope": scope_path,
             "scope_hash": scope_hash,
             "changes": changes,
         }
-        # Keep root_hash for backwards compat if provided
         if root_hash:
             entry["root"] = root_hash
         if conflicts:
             entry["conflicts"] = self._serialize_conflicts(conflicts)
         return entry
 
-    # Global version
-    def get_latest_version(self) -> int:
-        return self._backend.get_latest_version()
+    # ── Head ─────────────────────────────────
 
-    def set_latest_version(self, version: int):
-        self._backend.set_latest_version(version)
+    def get_head_commit_id(self) -> str:
+        return self._backend.get_head_commit_id()
 
-    # Per-scope version
-    def get_scope_version(self, scope_path: str) -> int:
-        return self._backend.get_scope_version(scope_path)
+    def set_head_commit_id(self, cid: str):
+        self._backend.set_head_commit_id(cid)
 
-    def set_scope_version(self, scope_path: str, version: int):
-        self._backend.set_scope_version(scope_path, version)
+    # ── Per-scope head + hash ────────────────
+
+    def get_scope_head_commit_id(self, scope_path: str) -> str:
+        return self._backend.get_scope_head_commit_id(scope_path)
+
+    def set_scope_head_commit_id(self, scope_path: str, cid: str):
+        self._backend.set_scope_head_commit_id(scope_path, cid)
 
     def get_scope_hash(self, scope_path: str) -> str:
         return self._backend.get_scope_hash(scope_path)
@@ -244,30 +294,34 @@ class HistoryManager:
     def set_scope_hash(self, scope_path: str, h: str):
         self._backend.set_scope_hash(scope_path, h)
 
-    # Version index
-    def get_version_index(self) -> dict:
-        return self._backend.get_version_index()
+    # ── Global root hash (legacy / clone fallback) ──
 
-    # Backwards compat
     def get_root_hash(self) -> str:
         return self._backend.get_root_hash()
 
     def set_root_hash(self, h: str):
         self._backend.set_root_hash(h)
 
-    def record(self, version: int, who: str, message: str,
+    # ── Record ───────────────────────────────
+
+    def record(self, commit_id: str, who: str, message: str,
                scope_path: str, changes: list,
                conflicts: list | None = None,
-               scope_hash: str = "", scope_version: str = "",
-               root_hash: str = ""):
-        entry = self._make_entry(version, who, message, scope_path, changes,
-                                 conflicts, scope_hash, scope_version, root_hash)
-        self._backend.record(version, entry)
-        self._backend.update_version_index(version, scope_path, scope_version)
+               scope_hash: str = "",
+               root_hash: str = "",
+               created_at_iso: str = ""):
+        entry = self._make_entry(
+            commit_id, who, message, scope_path, changes,
+            conflicts, scope_hash, root_hash, created_at_iso,
+        )
+        self._backend.record(entry)
 
-    def get_since(self, since_version: int, scope_path: str | None = None,
-                   limit: int = 0) -> list:
-        entries = self._backend.get_since(since_version, limit)
+    # ── Queries ──────────────────────────────
+
+    def get_since(self, since_commit_id: str,
+                  scope_path: str | None = None,
+                  limit: int = 0) -> list:
+        entries = self._backend.get_since(since_commit_id, limit)
         norm_scope = normalize_path(scope_path) if scope_path else None
         if norm_scope is None:
             return entries
@@ -278,25 +332,26 @@ class HistoryManager:
             result.append(_redact_for_scope(entry, norm_scope))
         return result
 
-    def get_entry(self, version: int) -> dict | None:
-        return self._backend.get_entry(version)
+    def get_entry(self, commit_id: str) -> dict | None:
+        return self._backend.get_entry(commit_id)
 
-    # Async wrappers
-    async def async_get_latest_version(self) -> int:
-        import asyncio
-        return await asyncio.to_thread(self.get_latest_version)
+    # ── Async wrappers ───────────────────────
 
-    async def async_set_latest_version(self, version: int):
+    async def async_get_head_commit_id(self) -> str:
         import asyncio
-        await asyncio.to_thread(self.set_latest_version, version)
+        return await asyncio.to_thread(self.get_head_commit_id)
 
-    async def async_get_scope_version(self, scope_path: str) -> int:
+    async def async_set_head_commit_id(self, cid: str):
         import asyncio
-        return await asyncio.to_thread(self.get_scope_version, scope_path)
+        await asyncio.to_thread(self.set_head_commit_id, cid)
 
-    async def async_set_scope_version(self, scope_path: str, version: int):
+    async def async_get_scope_head_commit_id(self, scope_path: str) -> str:
         import asyncio
-        await asyncio.to_thread(self.set_scope_version, scope_path, version)
+        return await asyncio.to_thread(self.get_scope_head_commit_id, scope_path)
+
+    async def async_set_scope_head_commit_id(self, scope_path: str, cid: str):
+        import asyncio
+        await asyncio.to_thread(self.set_scope_head_commit_id, scope_path, cid)
 
     async def async_get_scope_hash(self, scope_path: str) -> str:
         import asyncio
@@ -306,26 +361,27 @@ class HistoryManager:
         import asyncio
         await asyncio.to_thread(self.set_scope_hash, scope_path, h)
 
-    async def async_record(self, version: int, who: str, message: str,
+    async def async_record(self, commit_id: str, who: str, message: str,
                            scope_path: str, changes: list,
                            conflicts: list | None = None,
-                           scope_hash: str = "", scope_version: str = "",
-                           root_hash: str = ""):
+                           scope_hash: str = "",
+                           root_hash: str = "",
+                           created_at_iso: str = ""):
         import asyncio
         await asyncio.to_thread(
-            self.record, version, who, message, scope_path,
-            changes, conflicts, scope_hash, scope_version, root_hash,
+            self.record, commit_id, who, message, scope_path,
+            changes, conflicts, scope_hash, root_hash, created_at_iso,
         )
 
-    async def async_get_since(self, since_version: int,
+    async def async_get_since(self, since_commit_id: str,
                               scope_path: str | None = None,
                               limit: int = 0) -> list:
         import asyncio
-        return await asyncio.to_thread(self.get_since, since_version, scope_path, limit)
+        return await asyncio.to_thread(self.get_since, since_commit_id, scope_path, limit)
 
-    async def async_get_entry(self, version: int) -> dict | None:
+    async def async_get_entry(self, commit_id: str) -> dict | None:
         import asyncio
-        return await asyncio.to_thread(self.get_entry, version)
+        return await asyncio.to_thread(self.get_entry, commit_id)
 
     async def async_get_root_hash(self) -> str:
         import asyncio
@@ -335,17 +391,20 @@ class HistoryManager:
         import asyncio
         await asyncio.to_thread(self.set_root_hash, h)
 
-    # Scope migration
+    # ── Scope migration ──────────────────────
+
     def migrate_scope(self, old_scope_path: str,
                       new_scope_map: dict[str, str],
                       fallback_scope: str = "/") -> int:
+        """Rewrite scope paths on commit entries matching the old path.
+
+        Iterates every existing commit rather than a 1..latest version
+        range because commit identity is no longer a sequential int.
+        """
         old_norm = normalize_path(old_scope_path)
-        latest = self._backend.get_latest_version()
+        entries = self._backend.get_since("", limit=0)
         count = 0
-        for v in range(1, latest + 1):
-            entry = self._backend.get_entry(v)
-            if entry is None:
-                continue
+        for entry in entries:
             entry_scope = normalize_path(entry.get("scope", "/"))
             if entry_scope != old_norm:
                 continue
@@ -353,7 +412,7 @@ class HistoryManager:
                 entry.get("changes", []), new_scope_map, fallback_scope,
             )
             entry["scope"] = best_scope
-            self._backend.record(v, entry)
+            self._backend.record(entry)
             count += 1
         return count
 

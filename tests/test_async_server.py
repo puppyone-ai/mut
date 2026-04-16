@@ -3,7 +3,7 @@
 These tests create a real ServerRepo and call async handlers directly,
 verifying the full async push/pull/clone cycle and the three bug fixes:
   #1: lost_content + lost_hash persisted in history and audit
-  #2: Global lock protects version/root_hash across concurrent scope pushes
+  #2: Per-scope queue protects commit_id/scope state across concurrent pushes
   #3: lost_hash enables full content recovery
 """
 
@@ -16,10 +16,12 @@ from mut.server.repo import ServerRepo
 from mut.server.server import (
     _handle_clone, _handle_push, _handle_pull,
     _handle_negotiate,
-    _read_request, _read_body, _build_response,
-    _handle_health,
+    _build_response, _handle_health,
 )
 from mut.foundation.error import PermissionDenied
+
+
+_SEED = "seedseedseedseed"
 
 
 @pytest.fixture
@@ -27,7 +29,9 @@ def server_repo(tmp_path):
     repo = ServerRepo.init(str(tmp_path / "server"), project_name="test-proj")
     root = repo.build_full_tree()
     repo.set_root_hash(root)
-    repo.record_history(0, "server", "initial state", "/", [], root_hash=root)
+    repo.record_history(_SEED, "server", "initial state", "/", [],
+                        root_hash=root)
+    repo.set_head_commit_id(_SEED)
     return repo
 
 
@@ -44,11 +48,12 @@ def auth(rw_scope):
     return {"agent": "agent-A", "_scope": rw_scope}
 
 
-def _make_push_body(server_repo, files: dict, base_version: int = 0) -> dict:
+def _make_push_body(server_repo, files: dict,
+                    base_commit_id: str = "") -> dict:
     """Build a valid push body with tree + objects."""
     from mut.core import tree as tree_mod
 
-    nested = {}
+    nested: dict = {}
     for path, content in files.items():
         parts = path.split("/")
         d = nested
@@ -65,17 +70,22 @@ def _make_push_body(server_repo, files: dict, base_version: int = 0) -> dict:
             else:
                 sub_hash = write_nested(val)
                 entries[name] = ["T", sub_hash]
-        return server_repo.store.put(json.dumps(entries, sort_keys=True).encode())
+        return server_repo.store.put(
+            json.dumps(entries, sort_keys=True).encode()
+        )
 
     root_hash = write_nested(nested)
 
-    reachable = tree_mod.collect_reachable_hashes(server_repo.store, root_hash)
-    objects_b64 = {}
-    for h in reachable:
-        objects_b64[h] = base64.b64encode(server_repo.store.get(h)).decode()
+    reachable = tree_mod.collect_reachable_hashes(
+        server_repo.store, root_hash,
+    )
+    objects_b64 = {
+        h: base64.b64encode(server_repo.store.get(h)).decode()
+        for h in reachable
+    }
 
     return {
-        "base_version": base_version,
+        "base_commit_id": base_commit_id,
         "snapshots": [{"id": 1, "root": root_hash, "message": "test push",
                        "who": "agent-A", "time": ""}],
         "objects": objects_b64,
@@ -98,7 +108,7 @@ class TestAsyncClone:
         result = _run(_handle_clone(server_repo, auth, {}))
         assert result["project"] == "test-proj"
         assert isinstance(result["files"], dict)
-        assert isinstance(result["version"], int)
+        assert "head_commit_id" in result
 
     def test_clone_with_files(self, server_repo, auth):
         scope = auth["_scope"]
@@ -114,7 +124,7 @@ class TestAsyncClone:
 class TestAsyncPush:
     def test_push_empty_snapshots(self, server_repo, auth):
         result = _run(_handle_push(server_repo, auth, {
-            "base_version": 0, "snapshots": [], "objects": {},
+            "base_commit_id": "", "snapshots": [], "objects": {},
         }))
         assert result["status"] == "ok"
 
@@ -122,7 +132,7 @@ class TestAsyncPush:
         body = _make_push_body(server_repo, {"main.py": b"hello"})
         result = _run(_handle_push(server_repo, auth, body))
         assert result["status"] == "ok"
-        assert result["version"] == 1
+        assert len(result["commit_id"]) == 16
         assert result["pushed"] == 1
 
         scope = auth["_scope"]
@@ -137,30 +147,37 @@ class TestAsyncPush:
         with pytest.raises(PermissionDenied, match="read-only"):
             _run(_handle_push(server_repo, ro_auth, {}))
 
-    def test_push_increments_version(self, server_repo, auth):
+    def test_push_returns_new_commit_id(self, server_repo, auth):
         body1 = _make_push_body(server_repo, {"a.py": b"v1"})
         result1 = _run(_handle_push(server_repo, auth, body1))
-        assert result1["version"] == 1
+        cid1 = result1["commit_id"]
 
-        body2 = _make_push_body(server_repo, {"a.py": b"v2"}, base_version=1)
+        body2 = _make_push_body(server_repo, {"a.py": b"v2"},
+                                base_commit_id=cid1)
         result2 = _run(_handle_push(server_repo, auth, body2))
-        assert result2["version"] == 2
+        cid2 = result2["commit_id"]
+
+        assert cid1 != cid2
+        assert len(cid1) == 16 and len(cid2) == 16
 
 
 # ── Pull ──────────────────────────────────────
 
 class TestAsyncPull:
     def test_pull_up_to_date(self, server_repo, auth):
-        result = _run(_handle_pull(server_repo, auth, {"since_version": 0}))
+        server_repo.history.set_scope_head_commit_id("/src/", _SEED)
+        result = _run(_handle_pull(server_repo, auth,
+                                   {"since_commit_id": _SEED}))
         assert result["status"] == "up-to-date"
 
     def test_pull_after_push(self, server_repo, auth):
         body = _make_push_body(server_repo, {"f.txt": b"content"})
-        _run(_handle_push(server_repo, auth, body))
+        push_res = _run(_handle_push(server_repo, auth, body))
 
-        result = _run(_handle_pull(server_repo, auth, {"since_version": 0}))
+        result = _run(_handle_pull(server_repo, auth,
+                                   {"since_commit_id": ""}))
         assert result["status"] == "updated"
-        assert result["version"] == 1
+        assert result["head_commit_id"] == push_res["commit_id"]
         assert "f.txt" in result["files"]
 
 
@@ -191,23 +208,23 @@ class TestBugFixLostContentPersisted:
         _run(_handle_push(server_repo, auth, body1))
 
         body2 = _make_push_body(
-            server_repo, {"f.txt": b"override"}, base_version=0,
+            server_repo, {"f.txt": b"override"}, base_commit_id="",
         )
         result = _run(_handle_push(server_repo, auth, body2))
 
         if result.get("merged"):
-            entry = server_repo.get_history_entry(result["version"])
+            entry = server_repo.get_history_entry(result["commit_id"])
             assert "conflicts" in entry
             for conflict in entry["conflicts"]:
                 assert "lost_content" in conflict
                 assert "lost_hash" in conflict
 
 
-# ── Bug fix #2: global lock ──────────────────
+# ── Bug fix #2: per-scope serialization ──────
 
-class TestBugFixGlobalLock:
+class TestBugFixPerScopeSerialization:
     def test_concurrent_scope_pushes_atomic(self, server_repo):
-        """Two scopes pushing concurrently should not corrupt version/root."""
+        """Two scopes pushing concurrently should each land a unique commit."""
         server_repo.add_scope("scope-a", "/src/")
         server_repo.add_scope("scope-b", "/docs/")
 
@@ -228,17 +245,8 @@ class TestBugFixGlobalLock:
             )
 
         results = _run(run_concurrent())
-        versions = {r["version"] for r in results}
-        assert len(versions) == 2
-        assert server_repo.get_latest_version() == 2
-
-    def test_version_counter_atomic(self, server_repo):
-        """next_global_version() returns unique sequential values."""
-        v1 = server_repo.next_global_version()
-        v2 = server_repo.next_global_version()
-        assert v1 == 1
-        assert v2 == 2
-        assert server_repo.get_latest_version() == 2
+        commit_ids = {r["commit_id"] for r in results}
+        assert len(commit_ids) == 2  # two distinct commits
 
 
 # ── Bug fix #3: lost_hash for recovery ───────

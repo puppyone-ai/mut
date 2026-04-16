@@ -1,4 +1,4 @@
-"""Integration tests for v4 features — cross-scope auth, concurrent push, full workflow."""
+"""Integration tests for v4 features (commit-id identity)."""
 
 import asyncio
 import base64
@@ -13,6 +13,9 @@ from mut.server.server import (
 from mut.foundation.error import PermissionDenied, AuthenticationError
 
 
+_SEED = "seedseedseedseed"
+
+
 def _run(coro):
     loop = asyncio.new_event_loop()
     try:
@@ -23,10 +26,13 @@ def _run(coro):
 
 @pytest.fixture
 def server_repo(tmp_path):
-    repo = ServerRepo.init(str(tmp_path / "server"), project_name="integration-test")
+    repo = ServerRepo.init(str(tmp_path / "server"),
+                           project_name="integration-test")
     root = repo.build_full_tree()
     repo.set_root_hash(root)
-    repo.record_history(0, "server", "initial state", "/", [], root_hash=root)
+    repo.record_history(_SEED, "server", "initial state", "/", [],
+                        root_hash=root)
+    repo.set_head_commit_id(_SEED)
     return repo
 
 
@@ -39,10 +45,10 @@ def api_auth(server_repo, tmp_path):
     return ApiKeyAuth(server_repo.scopes, tmp_path / "creds.json")
 
 
-def _make_push_body(repo, files: dict, base_version: int = 0) -> dict:
+def _make_push_body(repo, files: dict, base_commit_id: str = "") -> dict:
     from mut.core import tree as tree_mod
 
-    nested = {}
+    nested: dict = {}
     for path, content in files.items():
         parts = path.split("/")
         d = nested
@@ -66,7 +72,7 @@ def _make_push_body(repo, files: dict, base_version: int = 0) -> dict:
     objects_b64 = {h: base64.b64encode(repo.store.get(h)).decode()
                    for h in reachable}
     return {
-        "base_version": base_version,
+        "base_commit_id": base_commit_id,
         "snapshots": [{"id": 1, "root": root_hash, "message": "test",
                        "who": "test", "time": ""}],
         "objects": objects_b64,
@@ -80,30 +86,24 @@ def _auth_context(api_auth, key):
 # ── Cross-Scope Auth Rejection ─────────────────────────────────
 
 class TestCrossScopeRejection:
-    def test_docs_key_cannot_push_to_src(self, server_repo, api_auth):
-        """A client with docs scope cannot push files outside /docs/."""
+    def test_docs_key_cannot_push_to_excluded_path(self, server_repo, api_auth):
+        """A client with docs scope + exclude cannot push into excluded subdir."""
         key_docs = api_auth.issue("alice", "scope-docs", "rw")
-        _auth_context(api_auth, key_docs)  # verify key works
+        _auth_context(api_auth, key_docs)
 
-        # Build a tree with a path that, when combined with scope prefix "docs",
-        # resolves to something outside scope. Use "../src/main.py" traversal.
-        # Actually, the scope validation checks full_path = "docs/<rel_path>"
-        # against check_path_permission. Files inside scope always pass.
-        # To test cross-scope rejection, we need a scope with excludes.
-        # Let's test with an exclude instead.
         server_repo.scopes.delete("scope-docs")
-        server_repo.add_scope("scope-docs", "/docs/", exclude=["/docs/secret/"])
+        server_repo.add_scope("scope-docs", "/docs/",
+                              exclude=["/docs/secret/"])
         scope = server_repo.scopes.get_by_id("scope-docs")
         scope["mode"] = "rw"
         auth_with_exclude = {"agent": "alice", "_scope": scope}
 
-        # Push a file that falls in the excluded path
-        body = _make_push_body(server_repo, {"secret/classified.txt": b"top secret"})
+        body = _make_push_body(server_repo,
+                               {"secret/classified.txt": b"top secret"})
         with pytest.raises(PermissionDenied, match="paths outside scope"):
             _run(_handle_push(server_repo, auth_with_exclude, body))
 
     def test_docs_key_can_push_to_docs(self, server_repo, api_auth):
-        """A client with docs scope CAN push files under docs/."""
         key_docs = api_auth.issue("alice", "scope-docs", "rw")
         auth = _auth_context(api_auth, key_docs)
 
@@ -112,7 +112,6 @@ class TestCrossScopeRejection:
         assert result["status"] == "ok"
 
     def test_readonly_key_cannot_push(self, server_repo, api_auth):
-        """Read-only key is rejected on push."""
         key_ro = api_auth.issue("reader", "scope-docs", "r")
         auth = _auth_context(api_auth, key_ro)
 
@@ -121,7 +120,6 @@ class TestCrossScopeRejection:
             _run(_handle_push(server_repo, auth, body))
 
     def test_readonly_key_can_clone(self, server_repo, api_auth):
-        """Read-only key CAN clone (read operations allowed)."""
         key_ro = api_auth.issue("reader", "scope-docs", "r")
         auth = _auth_context(api_auth, key_ro)
 
@@ -129,7 +127,6 @@ class TestCrossScopeRejection:
         assert result["project"] == "integration-test"
 
     def test_root_scope_can_access_everything(self, server_repo, api_auth):
-        """Root scope key can push to any path."""
         key_root = api_auth.issue("admin", "scope-all", "rw")
         auth = _auth_context(api_auth, key_root)
 
@@ -138,7 +135,6 @@ class TestCrossScopeRejection:
         assert result["status"] == "ok"
 
     def test_revoked_key_rejected_completely(self, server_repo, api_auth):
-        """Revoked key cannot clone, push, or pull."""
         key = api_auth.issue("alice", "scope-docs", "rw")
         api_auth.revoke(key)
 
@@ -158,31 +154,28 @@ class TestConcurrentPush:
             body = _make_push_body(server_repo, {name: content}, base)
             return await _handle_push(server_repo, auth, body)
 
+        # Both pushes share the same base commit (_SEED). After r1 commits,
+        # r2's base diverges from head → server triggers three-way merge
+        # so neither file is lost.
         async def go():
-            # Push two files concurrently to same scope
             r1, r2 = await asyncio.gather(
-                push_file("a.md", b"file-a", 0),
-                push_file("b.md", b"file-b", 0),
+                push_file("a.md", b"file-a", _SEED),
+                push_file("b.md", b"file-b", _SEED),
             )
             return r1, r2
 
         r1, r2 = _run(go())
-        # Both should succeed (one gets merged)
         assert r1["status"] == "ok"
         assert r2["status"] == "ok"
 
-        # Versions should be sequential
-        versions = sorted([r1["version"], r2["version"]])
-        assert versions == [1, 2]
+        assert r1["commit_id"] != r2["commit_id"]
 
-        # Both files should exist
         scope = auth["_scope"]
         files = server_repo.list_scope_files(scope)
         assert "a.md" in files
         assert "b.md" in files
 
     def test_different_scope_parallel(self, server_repo, api_auth):
-        """Pushes to different scopes can run in parallel."""
         key_docs = api_auth.issue("alice", "scope-docs", "rw")
         key_src = api_auth.issue("bob", "scope-src", "rw")
         auth_docs = _auth_context(api_auth, key_docs)
@@ -202,15 +195,18 @@ class TestConcurrentPush:
         r_docs, r_src = _run(go())
         assert r_docs["status"] == "ok"
         assert r_src["status"] == "ok"
+        assert r_docs["commit_id"] != r_src["commit_id"]
 
-    def test_three_way_merge_on_concurrent_same_scope(self, server_repo, api_auth):
+    def test_three_way_merge_on_concurrent_same_scope(self, server_repo,
+                                                       api_auth):
         """Concurrent pushes trigger server-side three-way merge."""
         key = api_auth.issue("alice", "scope-docs", "rw")
         auth = _auth_context(api_auth, key)
 
-        # Both start from v0, push different files
-        body_a = _make_push_body(server_repo, {"a.txt": b"aaa"}, 0)
-        body_b = _make_push_body(server_repo, {"b.txt": b"bbb"}, 0)
+        # Both pushes share the same base commit (_SEED). After r1 commits,
+        # r2's base diverges from head → three-way merge kicks in.
+        body_a = _make_push_body(server_repo, {"a.txt": b"aaa"}, _SEED)
+        body_b = _make_push_body(server_repo, {"b.txt": b"bbb"}, _SEED)
 
         async def go():
             r1 = await _handle_push(server_repo, auth, body_a)
@@ -219,11 +215,8 @@ class TestConcurrentPush:
 
         r1, r2 = _run(go())
 
-        # Second push should trigger merge (base=0, server=1)
-        assert r1["version"] == 1
-        assert r2["version"] == 2
+        assert r1["commit_id"] != r2["commit_id"]
 
-        # Both files should be present after merge
         scope = auth["_scope"]
         files = server_repo.list_scope_files(scope)
         assert "a.txt" in files
@@ -238,28 +231,25 @@ class TestFullWorkflow:
         key = api_auth.issue("alice", "scope-docs", "rw")
         auth = _auth_context(api_auth, key)
 
-        # v1
         body1 = _make_push_body(server_repo, {"doc.md": b"# Version 1"})
         r1 = _run(_handle_push(server_repo, auth, body1))
-        assert r1["version"] == 1
+        cid1 = r1["commit_id"]
 
-        # v2
-        body2 = _make_push_body(server_repo, {"doc.md": b"# Version 2"}, base_version=1)
+        body2 = _make_push_body(server_repo, {"doc.md": b"# Version 2"},
+                                base_commit_id=cid1)
         r2 = _run(_handle_push(server_repo, auth, body2))
-        assert r2["version"] == 2
+        cid2 = r2["commit_id"]
+        assert cid1 != cid2
 
-        # Rollback to v1
-        rb = _run(_handle_rollback(server_repo, auth, {"target_version": 1}))
+        rb = _run(_handle_rollback(server_repo, auth,
+                                   {"target_commit_id": cid1}))
         assert rb["status"] == "rolled-back"
-        assert rb["new_version"] == 3
+        assert rb["new_commit_id"] not in (cid1, cid2)
 
-        # Verify content via clone
         clone = _run(_handle_clone(server_repo, auth, {}))
         content = base64.b64decode(clone["files"]["doc.md"])
         assert content == b"# Version 1"
-
-        # Version chain: 0 → 1 → 2 → 3(rollback)
-        assert clone["version"] == 3
+        assert clone["head_commit_id"] == rb["new_commit_id"]
 
     def test_push_after_rollback(self, server_repo, api_auth):
         """Can push normally after a rollback."""
@@ -267,17 +257,21 @@ class TestFullWorkflow:
         auth = _auth_context(api_auth, key)
 
         body1 = _make_push_body(server_repo, {"a.txt": b"v1"})
-        _run(_handle_push(server_repo, auth, body1))
+        r1 = _run(_handle_push(server_repo, auth, body1))
 
-        body2 = _make_push_body(server_repo, {"a.txt": b"v2"}, 1)
-        _run(_handle_push(server_repo, auth, body2))
+        body2 = _make_push_body(server_repo, {"a.txt": b"v2"},
+                                base_commit_id=r1["commit_id"])
+        r2 = _run(_handle_push(server_repo, auth, body2))
 
-        _run(_handle_rollback(server_repo, auth, {"target_version": 1}))
+        rb = _run(_handle_rollback(server_repo, auth,
+                                   {"target_commit_id": r1["commit_id"]}))
 
-        # Push v4 on top of rollback
-        body4 = _make_push_body(server_repo, {"a.txt": b"v4-new"}, 3)
+        body4 = _make_push_body(server_repo, {"a.txt": b"v4-new"},
+                                base_commit_id=rb["new_commit_id"])
         r4 = _run(_handle_push(server_repo, auth, body4))
-        assert r4["version"] == 4
+        assert r4["commit_id"] not in (
+            r1["commit_id"], r2["commit_id"], rb["new_commit_id"],
+        )
 
         scope = auth["_scope"]
         files = server_repo.list_scope_files(scope)
@@ -294,20 +288,18 @@ class TestPullScopeIsolation:
         auth_docs = _auth_context(api_auth, key_docs)
         auth_src = _auth_context(api_auth, key_src)
 
-        # Push to docs
         body_docs = _make_push_body(server_repo, {"readme.md": b"# Docs"})
         _run(_handle_push(server_repo, auth_docs, body_docs))
 
-        # Push to src
         body_src = _make_push_body(server_repo, {"main.py": b"print(1)"})
         _run(_handle_push(server_repo, auth_src, body_src))
 
-        # Pull as docs user
-        pull_result = _run(_handle_pull(server_repo, auth_docs, {"since_version": 0}))
+        pull_result = _run(_handle_pull(server_repo, auth_docs,
+                                        {"since_commit_id": ""}))
         assert "readme.md" in pull_result["files"]
         assert "main.py" not in pull_result["files"]
 
-        # Pull as src user
-        pull_result2 = _run(_handle_pull(server_repo, auth_src, {"since_version": 0}))
+        pull_result2 = _run(_handle_pull(server_repo, auth_src,
+                                         {"since_commit_id": ""}))
         assert "main.py" in pull_result2["files"]
         assert "readme.md" not in pull_result2["files"]

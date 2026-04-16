@@ -236,7 +236,9 @@ def main():
             # Link with root_dir_name
             result = link_access_op.link_access(repo_b, server_url, root_dir_name="research", credential_override=credential)
             t.check("Link succeeds", result.get("status") == "linked", json.dumps(result)[:200])
-            t.check("Scope created", result.get("scope_created") is True or result.get("server_version", 0) > 0)
+            t.check("Scope created",
+                    result.get("scope_created") is True
+                    or bool(result.get("server_commit_id")))
 
             # Verify directory created locally
             t.check("research/ dir exists", (Path(workdir_b) / "research").is_dir())

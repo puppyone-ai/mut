@@ -6,7 +6,7 @@ the merged result. This keeps conflict resolution entirely on the server.
 Steps:
 1. Reject uncommitted changes (user must commit or --force)
 2. If unpushed commits exist → auto-push (server merges)
-3. POST /pull with since_version + have_hashes
+3. POST /pull with since_commit_id + have_hashes
 4. Overwrite working directory with server result
 5. Update objects, snapshots, manifest, HEAD, REMOTE_HEAD
 """
@@ -53,11 +53,11 @@ def pull(repo: MutRepo, force: bool = False) -> dict:
     client = MutClient(server_url, credential, user_identity=user_identity)
 
     remote_head_path = repo.mut_root / REMOTE_HEAD_FILE
-    since_version = (int(read_text(remote_head_path))
-                     if remote_head_path.exists() else 0)
+    since_commit_id = (read_text(remote_head_path).strip()
+                       if remote_head_path.exists() else "")
 
     have_hashes = repo.store.all_hashes()
-    resp = client.pull(since_version, have_hashes=have_hashes)
+    resp = client.pull(since_commit_id, have_hashes=have_hashes)
 
     if resp["status"] == "up-to-date":
         result: dict = {"status": "up-to-date", "pulled": 0}
@@ -67,7 +67,7 @@ def pull(repo: MutRepo, force: bool = False) -> dict:
 
     files_b64 = resp.get("files", {})
     objects_b64 = resp.get("objects", {})
-    server_version = resp.get("version", since_version)
+    head_commit_id = resp.get("head_commit_id", since_commit_id)
 
     for h, b64data in objects_b64.items():
         repo.store.put(base64.b64decode(b64data))
@@ -82,21 +82,23 @@ def pull(repo: MutRepo, force: bool = False) -> dict:
 
     root_hash = tree_mod.scan_dir(repo.store, repo.workdir, repo.ignore)
 
+    short = head_commit_id[:8] if head_commit_id else "(empty)"
     repo.snapshots.create(root_hash, "pull",
-                          f"pulled from server (v{server_version})",
-                          pushed=True)
+                          f"pulled from server (#{short})",
+                          pushed=True,
+                          server_commit_id=head_commit_id)
 
     new_manifest = tree_mod.tree_to_flat(repo.store, root_hash)
     manifest_mod.save(repo.mut_root, new_manifest)
 
     latest_snap = repo.snapshots.latest()
     write_text(repo.mut_root / HEAD_FILE, str(latest_snap["id"]))
-    write_text(remote_head_path, str(server_version))
+    write_text(remote_head_path, head_commit_id)
 
     result = {
         "status": "updated",
         "pulled": len(files_b64),
-        "server_version": server_version,
+        "server_commit_id": head_commit_id,
     }
     if push_result:
         result["push"] = push_result

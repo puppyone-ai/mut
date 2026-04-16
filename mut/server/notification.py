@@ -19,15 +19,15 @@ from datetime import datetime, timezone
 
 @dataclass
 class Notification:
-    """A version-update notification for a client."""
+    """A commit-update notification for a client."""
     notification_id: str
     repo: str
     scope: str
-    version: int
+    commit_id: str
     pushed_by: str
     changed_files: list[str]
     timestamp: str
-    type: str = "version_update"
+    type: str = "commit_update"
 
     def to_dict(self) -> dict:
         return {
@@ -35,7 +35,7 @@ class Notification:
             "notification_id": self.notification_id,
             "repo": self.repo,
             "scope": self.scope,
-            "version": self.version,
+            "commit_id": self.commit_id,
             "pushed_by": self.pushed_by,
             "changed_files": self.changed_files,
             "timestamp": self.timestamp,
@@ -103,7 +103,7 @@ class NotificationManager:
         self.repo_name = repo_name
         self.sink = sink or InMemoryNotificationSink()
 
-    def create_notification(self, scope_path: str, version: int,
+    def create_notification(self, scope_path: str, commit_id: str,
                             pushed_by: str,
                             changes: list[dict]) -> Notification:
         changed_files = [c.get("path", "") for c in changes]
@@ -111,13 +111,13 @@ class NotificationManager:
             notification_id=str(uuid.uuid4()),
             repo=self.repo_name,
             scope=scope_path,
-            version=version,
+            commit_id=commit_id,
             pushed_by=pushed_by,
             changed_files=changed_files,
             timestamp=datetime.now(timezone.utc).isoformat(),
         )
 
-    async def notify_after_push(self, scope_path: str, version: int,
+    async def notify_after_push(self, scope_path: str, commit_id: str,
                                 pushed_by: str, changes: list[dict],
                                 client_ids: list[str]) -> dict:
         """Send notifications to all relevant clients except the pusher.
@@ -125,7 +125,7 @@ class NotificationManager:
         Returns {"sent": [...], "queued": [...]}.
         """
         notification = self.create_notification(
-            scope_path, version, pushed_by, changes,
+            scope_path, commit_id, pushed_by, changes,
         )
 
         sent = []

@@ -30,8 +30,8 @@ class TestServerRepoInit:
     def test_project_name(self, server_repo):
         assert server_repo.get_project_name() == "test-project"
 
-    def test_initial_version_zero(self, server_repo):
-        assert server_repo.get_latest_version() == 0
+    def test_initial_head_empty(self, server_repo):
+        assert server_repo.get_head_commit_id() == ""
 
 
 class TestServerRepoScopes:
@@ -117,11 +117,15 @@ class TestServerRepoLock:
         server_repo.release_lock("scope-1")
 
 
+_CID_1 = "a1b2c3d4e5f60718"
+_CID_2 = "1122334455667788"
+
+
 class TestServerRepoHistory:
-    def test_version_management(self, server_repo):
-        assert server_repo.get_latest_version() == 0
-        server_repo.set_latest_version(5)
-        assert server_repo.get_latest_version() == 5
+    def test_head_management(self, server_repo):
+        assert server_repo.get_head_commit_id() == ""
+        server_repo.set_head_commit_id(_CID_1)
+        assert server_repo.get_head_commit_id() == _CID_1
 
     def test_root_hash(self, server_repo):
         assert server_repo.get_root_hash() == ""
@@ -129,17 +133,20 @@ class TestServerRepoHistory:
         assert server_repo.get_root_hash() == "abc123"
 
     def test_record_and_get_history(self, server_repo):
-        server_repo.record_history(1, "agent-A", "push 1", "/src/",
-                                   [{"path": "src/main.py", "action": "add"}])
-        entry = server_repo.get_history_entry(1)
+        server_repo.record_history(
+            _CID_1, "agent-A", "push 1", "/src/",
+            [{"path": "src/main.py", "action": "add"}],
+        )
+        entry = server_repo.get_history_entry(_CID_1)
         assert entry is not None
         assert entry["who"] == "agent-A"
+        assert entry["commit_id"] == _CID_1
 
     def test_history_since(self, server_repo):
-        server_repo.record_history(1, "a", "v1", "/src/", [])
-        server_repo.record_history(2, "b", "v2", "/src/", [])
-        server_repo.set_latest_version(2)
-        entries = server_repo.get_history_since(0, scope_path="/src/")
+        server_repo.record_history(_CID_1, "a", "v1", "/src/", [])
+        server_repo.record_history(_CID_2, "b", "v2", "/src/", [])
+        server_repo.set_head_commit_id(_CID_2)
+        entries = server_repo.get_history_since("", scope_path="/src/")
         assert len(entries) == 2
 
 
