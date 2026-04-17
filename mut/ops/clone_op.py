@@ -75,6 +75,7 @@ def clone(server_url: str, credential: str, workdir: str = None) -> MutRepo:
         "message": f"cloned from {server_url}",
         "time": "",
         "pushed": True,
+        "server_commit_id": head_commit_id,
     }
     write_json(mut / SNAPSHOTS_FILE, [snap_entry])
 

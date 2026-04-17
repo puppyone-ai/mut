@@ -7,7 +7,7 @@ import pytest
 
 from mut.server.repo import ServerRepo
 from mut.server.auth.api_key import ApiKeyAuth
-from mut.server.server import (
+from tests._handlers_shim import (
     _handle_clone, _handle_push, _handle_pull, _handle_rollback,
 )
 from mut.foundation.error import PermissionDenied, AuthenticationError

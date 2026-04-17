@@ -13,10 +13,10 @@ import json
 import pytest
 
 from mut.server.repo import ServerRepo
-from mut.server.server import (
+from mut.server.server import _build_response, _handle_health
+from tests._handlers_shim import (
     _handle_clone, _handle_push, _handle_pull,
     _handle_negotiate,
-    _build_response, _handle_health,
 )
 from mut.foundation.error import PermissionDenied
 
@@ -203,7 +203,13 @@ class TestAsyncNegotiate:
 
 class TestBugFixLostContentPersisted:
     def test_lost_content_in_history(self, server_repo, auth):
-        """Verify conflict lost_content and lost_hash are saved in history."""
+        """Verify conflict lost_content and lost_hash are saved in history.
+
+        Push 1 and push 2 touch the same file with different content; the
+        second push uses an empty base_commit_id to simulate a stale
+        client. The server MUST trigger a three-way merge and persist
+        lost_content + lost_hash for the overwritten version.
+        """
         body1 = _make_push_body(server_repo, {"f.txt": b"original"})
         _run(_handle_push(server_repo, auth, body1))
 
@@ -212,12 +218,114 @@ class TestBugFixLostContentPersisted:
         )
         result = _run(_handle_push(server_repo, auth, body2))
 
-        if result.get("merged"):
-            entry = server_repo.get_history_entry(result["commit_id"])
-            assert "conflicts" in entry
-            for conflict in entry["conflicts"]:
-                assert "lost_content" in conflict
-                assert "lost_hash" in conflict
+        # Unconditional check — previously wrapped in `if result.get("merged"):`
+        # which silently passed when the merge was (buggily) skipped.
+        assert result.get("merged"), (
+            "stale base_commit_id must trigger server-side merge"
+        )
+        entry = server_repo.get_history_entry(result["commit_id"])
+        assert "conflicts" in entry and entry["conflicts"], \
+            "merge must record at least one conflict entry"
+        for conflict in entry["conflicts"]:
+            assert "lost_content" in conflict
+            assert "lost_hash" in conflict
+
+
+class TestBugFixEmptyBasePreservesServerFiles:
+    """Regression for Bug #1: empty base_commit_id must NOT delete
+    server-only files. The buggy short-circuit in _resolve_conflicts
+    was returning their_files verbatim, causing _apply_merged_files to
+    drop every file not in the incoming push.
+    """
+
+    def test_empty_base_preserves_untouched_server_files(
+        self, server_repo, auth,
+    ):
+        """Push A, then push B with empty base. A must still exist."""
+        body1 = _make_push_body(server_repo, {"a.py": b"first"})
+        _run(_handle_push(server_repo, auth, body1))
+
+        body2 = _make_push_body(
+            server_repo, {"b.py": b"second"}, base_commit_id="",
+        )
+        _run(_handle_push(server_repo, auth, body2))
+
+        scope = auth["_scope"]
+        files = server_repo.list_scope_files(scope)
+        assert "a.py" in files, "server-only file was silently deleted"
+        assert "b.py" in files, "pushed file must be persisted"
+        assert files["a.py"] == b"first"
+        assert files["b.py"] == b"second"
+
+    def test_stale_base_preserves_concurrent_server_additions(
+        self, server_repo, auth,
+    ):
+        """Known-but-stale base. Realistic clients always push a FULL
+        workdir tree; the test mirrors that by keeping pre-existing files
+        in every subsequent push body. The 3-way merge must preserve
+        files that a concurrent pusher added in between.
+        """
+        body1 = _make_push_body(server_repo, {"a.py": b"first"})
+        r1 = _run(_handle_push(server_repo, auth, body1))
+        cid1 = r1["commit_id"]
+
+        # Agent B rebuilt its workdir and also pushed a new file b.py.
+        body2 = _make_push_body(
+            server_repo,
+            {"a.py": b"first", "b.py": b"second"},
+            base_commit_id=cid1,
+        )
+        _run(_handle_push(server_repo, auth, body2))
+
+        # Agent A pushes with a stale base (hasn't seen B's b.py yet),
+        # adding c.py alongside the unchanged a.py.
+        body3 = _make_push_body(
+            server_repo,
+            {"a.py": b"first", "c.py": b"third"},
+            base_commit_id=cid1,
+        )
+        _run(_handle_push(server_repo, auth, body3))
+
+        scope = auth["_scope"]
+        files = server_repo.list_scope_files(scope)
+        assert set(files.keys()) == {"a.py", "b.py", "c.py"}
+        assert files["b.py"] == b"second", (
+            "B's file must survive A's stale push via 3-way merge"
+        )
+        assert files["c.py"] == b"third"
+
+
+# ── Bug fix: clone returns scope-level head ───
+
+class TestBugFixCloneReturnsScopeHead:
+    """Regression for Bug #2: clone must return scope_head_commit_id,
+    NOT the global head. Otherwise the client stores a cross-scope
+    commit in REMOTE_HEAD and /pull, /push misbehave."""
+
+    def test_clone_returns_scope_head_not_global(self, server_repo):
+        # Seed two scopes; push to /docs/ so the global head points there.
+        server_repo.add_scope("scope-src", "/src/")
+        server_repo.add_scope("scope-docs", "/docs/")
+        src_scope = server_repo.scopes.get_by_id("scope-src")
+        docs_scope = server_repo.scopes.get_by_id("scope-docs")
+        src_scope["mode"] = "rw"
+        docs_scope["mode"] = "rw"
+
+        # Push to /docs/ — this advances the GLOBAL head to docs's commit.
+        body = _make_push_body(server_repo, {"readme.md": b"hi"})
+        docs_res = _run(_handle_push(
+            server_repo, {"agent": "a", "_scope": docs_scope}, body,
+        ))
+        docs_cid = docs_res["commit_id"]
+
+        # Clone /src/ — should return /src/'s scope head (empty),
+        # not the global head (= docs_cid).
+        src_clone = _run(_handle_clone(
+            server_repo, {"agent": "b", "_scope": src_scope}, {},
+        ))
+        assert src_clone["head_commit_id"] != docs_cid
+        assert src_clone["head_commit_id"] == \
+            server_repo.history.get_scope_head_commit_id("/src/")
 
 
 # ── Bug fix #2: per-scope serialization ──────

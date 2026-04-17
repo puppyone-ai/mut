@@ -77,6 +77,23 @@ class TestHistoryManager:
         since_first = history.get_since(_CID_1)
         assert len(since_first) == 2
 
+    def test_get_since_unknown_commit_id_fails_open(self, history):
+        """Regression: unknown since_commit_id must NOT silently return []
+        (previously caused clients to miss history after cross-scope or
+        pruned commits).
+        """
+        history.record(_CID_1, "a", "v1", "/src/", [],
+                       created_at_iso="2026-04-16T12:00:01+00:00")
+        history.record(_CID_2, "b", "v2", "/docs/", [],
+                       created_at_iso="2026-04-16T12:00:02+00:00")
+
+        unknown = "deadbeefdeadbeef"
+        entries = history.get_since(unknown)
+        assert len(entries) == 2, (
+            "unknown since_commit_id should fall back to returning every "
+            "known entry, not an empty list"
+        )
+
     def test_get_since_scope_filter(self, history):
         history.record(_CID_1, "a", "v1", "/src/",
                        [{"path": "src/main.py", "action": "add"}],

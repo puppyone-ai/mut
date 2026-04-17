@@ -12,7 +12,7 @@ import pytest
 import time
 
 from mut.server.repo import ServerRepo
-from mut.server.server import (
+from tests._handlers_shim import (
     _handle_push, _handle_pull, _handle_clone,
     _handle_rollback, _handle_pull_commit,
 )

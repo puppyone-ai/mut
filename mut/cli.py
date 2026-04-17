@@ -288,7 +288,7 @@ def cmd_rollback(args):
         print(f"Already at commit {args.commit_id[:8]}")
     else:
         target = result.get("target_commit_id", args.commit_id)
-        new_cid = result.get("commit_id", "")
+        new_cid = result.get("new_commit_id", "")
         print(f"Rolled back to #{target[:8]}")
         if new_cid:
             print(f"  new server commit: #{new_cid[:8]}")

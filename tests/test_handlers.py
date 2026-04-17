@@ -9,7 +9,7 @@ import base64
 import pytest
 
 from mut.server.repo import ServerRepo
-from mut.server.handlers import (
+from tests._handlers_shim import (
     handle_clone, handle_push, handle_pull,
     handle_negotiate,
 )
@@ -67,6 +67,32 @@ class TestHandleClone:
     def test_clone_protocol_version(self, server_repo, auth):
         result = handle_clone(server_repo, auth, {})
         assert "protocol_version" in result
+
+    def test_clone_returns_scope_head_not_global(self, server_repo):
+        """Regression for Bug #2: clone must return the per-scope head,
+        otherwise the client's REMOTE_HEAD ends up as a commit from a
+        different scope and /pull + /push misbehave.
+        """
+        server_repo.add_scope("scope-src", "/src/")
+        server_repo.add_scope("scope-docs", "/docs/")
+        src_scope = server_repo.scopes.get_by_id("scope-src")
+        docs_scope = server_repo.scopes.get_by_id("scope-docs")
+        src_scope["mode"] = "rw"
+        docs_scope["mode"] = "rw"
+
+        docs_cid = "d" * 16
+        server_repo.record_history(
+            docs_cid, "agent-D", "push to docs", "/docs/", [],
+        )
+        server_repo.history.set_scope_head_commit_id("/docs/", docs_cid)
+        server_repo.set_head_commit_id(docs_cid)
+
+        src_result = handle_clone(
+            server_repo, {"agent": "agent-A", "_scope": src_scope}, {},
+        )
+        assert src_result["head_commit_id"] != docs_cid
+        assert src_result["head_commit_id"] == \
+            server_repo.history.get_scope_head_commit_id("/src/")
 
 
 class TestHandlePush:
@@ -144,7 +170,11 @@ class TestHandlePush:
             handle_push(server_repo, ro_auth, {})
 
     def test_push_cas_retry_on_concurrent_update(self, server_repo, auth):
-        """Stale base_commit_id still succeeds via server-side merge."""
+        """Stale base_commit_id still succeeds via server-side merge AND
+        MUST NOT silently delete files that were only on the server.
+        Regression guard for the empty-base short-circuit bug in
+        `_resolve_conflicts`.
+        """
         r1 = self._push_with_files(server_repo, auth, {"a.py": b"first"})
         assert r1["status"] == "ok"
 
@@ -153,6 +183,16 @@ class TestHandlePush:
             base_commit_id="",  # stale (empty) base
         )
         assert r2["status"] == "ok"
+
+        scope = auth["_scope"]
+        files = server_repo.list_scope_files(scope)
+        assert "a.py" in files, (
+            "regression: empty base_commit_id caused the server to drop "
+            "a file from the previous push"
+        )
+        assert files["a.py"] == b"first"
+        assert "b.py" in files
+        assert files["b.py"] == b"second"
 
     def test_push_returns_new_commit_id(self, server_repo, auth):
         r1 = self._push_with_files(server_repo, auth, {"a.py": b"v1"})

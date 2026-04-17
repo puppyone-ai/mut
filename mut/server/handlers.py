@@ -25,6 +25,7 @@ from mut.core.protocol import (
     CloneResponse, PushRequest, PushResponse, PullRequest, PullResponse,
     NegotiateRequest, NegotiateResponse, RollbackRequest, RollbackResponse,
     PullCommitRequest, ScopeInfo, normalize_path,
+    require_supported_protocol,
 )
 from mut.core.scope import check_path_permission
 from mut.core import tree as tree_mod
@@ -37,7 +38,8 @@ from mut.server.repo import ServerRepo
 
 # ── Clone ──────────────────────────────────────
 
-def handle_clone(repo: ServerRepo, auth: dict, _body: dict) -> dict:
+def handle_clone(repo: ServerRepo, auth: dict, body: dict) -> dict:
+    require_supported_protocol(body)
     scope = auth["_scope"]
 
     files_raw = repo.list_scope_files(scope)
@@ -50,7 +52,11 @@ def handle_clone(repo: ServerRepo, auth: dict, _body: dict) -> dict:
                    for h in scope_hashes}
 
     MAX_CLONE_HISTORY = 200
-    head_commit_id = repo.get_head_commit_id()
+    # Return the SCOPE-level head so the client's REMOTE_HEAD matches
+    # what /pull and /push compare against later. Using the global head
+    # here would leak commits from other scopes and make every first
+    # pull after clone look "stale" even when nothing changed.
+    head_commit_id = repo.get_scope_head_commit_id(scope["path"])
     history = repo.get_history_since("", scope_path=scope["path"],
                                      limit=MAX_CLONE_HISTORY)
 
@@ -81,6 +87,7 @@ def handle_clone(repo: ServerRepo, auth: dict, _body: dict) -> dict:
 MAX_CAS_RETRIES = 3
 
 def handle_push(repo: ServerRepo, auth: dict, body: dict) -> dict:
+    require_supported_protocol(body)
     scope = auth["_scope"]
 
     if scope.get("mode", "r") == "r":
@@ -203,15 +210,45 @@ def _push_cas_attempt(
 
 # ── Negotiate ──────────────────────────────────
 
-def handle_negotiate(repo: ServerRepo, _auth: dict, body: dict) -> dict:
+def handle_negotiate(repo: ServerRepo, auth: dict, body: dict) -> dict:
+    """Object dedup + REMOTE_HEAD self-heal probe (Bug #6).
+
+    Always reports back the server's current scope head so a client that
+    has lost its REMOTE_HEAD (truncated history, restored backup, or a
+    fresh clone race) can re-anchor without an extra round-trip. When
+    the client sends the commit_id it *thinks* the server is at via
+    ``remote_head``, we additionally set ``remote_head_recognized=False``
+    if that commit no longer exists in our history — the signal that
+    tells :meth:`SnapshotChain.reset_pushed_watermark` to clear the
+    "already pushed" flag so the next push re-uploads.
+    """
+    require_supported_protocol(body)
     req = NegotiateRequest.from_dict(body)
+    scope = auth.get("_scope") or {}
+
     missing = [h for h in req.hashes if not repo.store.exists(h)]
-    return NegotiateResponse(missing=missing).to_dict()
+
+    scope_path = scope.get("path", "")
+    server_head = (repo.get_scope_head_commit_id(scope_path)
+                   if scope_path else "") or repo.get_head_commit_id()
+
+    # An empty remote_head means "client did not send one" — treat as
+    # recognised so `mut push` doesn't reset the watermark gratuitously.
+    recognised = True
+    if req.remote_head:
+        recognised = repo.get_history_entry(req.remote_head) is not None
+
+    return NegotiateResponse(
+        missing=missing,
+        server_head_commit_id=server_head,
+        remote_head_recognized=recognised,
+    ).to_dict()
 
 
 # ── Pull ───────────────────────────────────────
 
 def handle_pull(repo: ServerRepo, auth: dict, body: dict) -> dict:
+    require_supported_protocol(body)
     scope = auth["_scope"]
     req = PullRequest.from_dict(body)
 
@@ -270,6 +307,7 @@ def _resolve_scope_tree_hash(repo: ServerRepo, entry: dict,
 
 def handle_pull_commit(repo: ServerRepo, auth: dict, body: dict) -> dict:
     """Pull files at a specific historical commit (not just HEAD)."""
+    require_supported_protocol(body)
     scope = auth["_scope"]
     req = PullCommitRequest.from_dict(body)
     target_commit_id = req.commit_id
@@ -325,6 +363,7 @@ def handle_rollback(repo: ServerRepo, auth: dict, body: dict) -> dict:
     Uses CAS (compare-and-swap) on scope_hash to prevent concurrent
     rollbacks from silently overwriting each other — same safety as push.
     """
+    require_supported_protocol(body)
     scope = auth["_scope"]
     if scope.get("mode", "r") == "r":
         raise PermissionDenied("scope is read-only")
@@ -455,11 +494,18 @@ def _validate_scope_paths(scope: dict, scope_prefix: str,
 
 def _resolve_conflicts(repo, scope, base_commit_id, current_head_commit,
                        our_files, their_files):
-    """Three-way merge iff the client's base diverges from server head."""
-    if base_commit_id and current_head_commit and base_commit_id != current_head_commit:
-        base_files = _get_base_files(repo, scope, base_commit_id)
-        return merge_file_sets(base_files, our_files, their_files)
-    return their_files, []
+    """Three-way merge whenever the client's base diverges from server head.
+
+    Empty ``base_commit_id`` means the client never synced (or lost its
+    REMOTE_HEAD). We MUST still run the merge — otherwise any file that
+    exists on the server but isn't in the push would be silently deleted
+    by :func:`_apply_merged_files`.
+    """
+    if base_commit_id == current_head_commit:
+        return their_files, []
+    base_files = (_get_base_files(repo, scope, base_commit_id)
+                  if base_commit_id else {})
+    return merge_file_sets(base_files, our_files, their_files)
 
 
 def _apply_merged_files(repo, scope, old_scope_files, merged_files):

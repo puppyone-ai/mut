@@ -6,8 +6,10 @@ import json
 import pytest
 
 from mut.server.repo import ServerRepo
-from mut.server.server import _handle_push, _handle_rollback, _handle_clone
-from mut.server.handlers import handle_rollback
+from tests._handlers_shim import (
+    _handle_push, _handle_rollback, _handle_clone,
+    handle_rollback,
+)
 
 
 _SEED = "seedseedseedseed"

@@ -64,3 +64,18 @@ class PayloadTooLargeError(MutError):
 class ValidationError(MutError):
     """Raised when request data fails schema/semantic validation."""
     http_status = 422
+
+
+class ClientTooOldError(MutError):
+    """Raised when a client speaks an outdated wire protocol version.
+
+    Per the design in ``docs/design/mut-git-alignment.md`` and mirroring
+    Git's ``Git-Protocol`` header negotiation, the server rejects any
+    request whose ``protocol_version`` falls below
+    :data:`mut.core.protocol.MIN_SUPPORTED_PROTOCOL_VERSION` instead of
+    silently defaulting missing fields — the latter let old clients
+    push trees without their real ``base_commit_id`` being honored and
+    silently bypass three-way merge. Returns HTTP 426 so clients can
+    recognize "upgrade required" without confusing it with 400/422.
+    """
+    http_status = 426

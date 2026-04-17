@@ -166,12 +166,18 @@ class FileSystemHistoryBackend(HistoryBackend):
 
         if since_commit_id:
             since_entry = self.get_entry(since_commit_id)
-            if since_entry is None:
-                return []
-            since_key = (since_entry.get("time", ""),
-                         since_entry.get("commit_id", ""))
-            entries = [e for e in entries
-                       if (e.get("time", ""), e.get("commit_id", "")) > since_key]
+            if since_entry is not None:
+                # Known commit: return strictly-newer entries.
+                since_key = (since_entry.get("time", ""),
+                             since_entry.get("commit_id", ""))
+                entries = [e for e in entries
+                           if (e.get("time", ""),
+                               e.get("commit_id", "")) > since_key]
+            # Unknown commit (e.g. from another scope, pruned, or a
+            # corrupted REMOTE_HEAD): fail OPEN and return every entry
+            # we have. Previously we returned [] here, which made
+            # clients miss history entries after their file content
+            # had already been synced.
 
         if limit > 0:
             entries = entries[-limit:]

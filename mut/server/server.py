@@ -26,7 +26,10 @@ import json
 from datetime import datetime, timezone
 
 from mut.foundation.config import normalize_path, HASH_LEN
-from mut.core.protocol import PROTOCOL_VERSION
+from mut.core.protocol import (
+    PROTOCOL_VERSION, NegotiateRequest, NegotiateResponse,
+    require_supported_protocol,
+)
 from mut.core.merge import merge_file_sets
 from mut.core.scope import check_path_permission
 from mut.core import tree as tree_mod
@@ -50,7 +53,8 @@ MAX_CLONE_HISTORY = 200
 _STATUS_TEXT = {
     200: "OK", 400: "Bad Request", 401: "Unauthorized", 403: "Forbidden",
     404: "Not Found", 409: "Conflict", 413: "Payload Too Large",
-    422: "Unprocessable Entity", 500: "Internal Server Error", 502: "Bad Gateway",
+    422: "Unprocessable Entity", 426: "Upgrade Required",
+    500: "Internal Server Error", 502: "Bad Gateway",
 }
 
 
@@ -111,7 +115,8 @@ async def _send_error(writer: asyncio.StreamWriter, status: int, message: str):
 
 # ── Handlers ──────────────────────────────────
 
-async def _handle_clone(repo: ServerRepo, auth: dict, _body: dict) -> dict:
+async def _handle_clone(repo: ServerRepo, auth: dict, body: dict) -> dict:
+    require_supported_protocol(body)
     scope = auth["_scope"]
 
     files_raw = await repo.async_list_scope_files(scope)
@@ -123,7 +128,10 @@ async def _handle_clone(repo: ServerRepo, auth: dict, _body: dict) -> dict:
     objects_b64 = {h: base64.b64encode(repo.store.get(h)).decode()
                    for h in scope_hashes}
 
-    head_commit_id = await repo.async_get_head_commit_id()
+    # Return the SCOPE-level head so the client's REMOTE_HEAD matches
+    # what /pull and /push compare against later. Symmetric with the
+    # sync handler in mut.server.handlers.handle_clone.
+    head_commit_id = await repo.async_get_scope_head_commit_id(scope["path"])
     history = await repo.async_get_history_since("", scope_path=scope["path"],
                                                  limit=MAX_CLONE_HISTORY)
 
@@ -149,6 +157,7 @@ async def _handle_clone(repo: ServerRepo, auth: dict, _body: dict) -> dict:
 
 
 async def _handle_push(repo: ServerRepo, auth: dict, body: dict) -> dict:
+    require_supported_protocol(body)
     scope = auth["_scope"]
 
     if scope.get("mode", "r") == "r":
@@ -268,19 +277,47 @@ def _is_valid_hash(h: str) -> bool:
     return isinstance(h, str) and 0 < len(h) <= HASH_LEN and h.isalnum()
 
 
-async def _handle_negotiate(repo: ServerRepo, _auth: dict, body: dict) -> dict:
-    offered = body.get("hashes", [])
+async def _handle_negotiate(repo: ServerRepo, auth: dict, body: dict) -> dict:
+    """Async twin of :func:`mut.server.handlers.handle_negotiate`.
+
+    Same contract: probe missing objects, advertise the server's scope
+    head, and tell the client whether its declared ``remote_head``
+    still exists in our history (Bug #6 self-heal).
+    """
+    require_supported_protocol(body)
+    req = NegotiateRequest.from_dict(body)
+    scope = (auth or {}).get("_scope") or {}
+
     missing = []
-    for h in offered:
+    for h in req.hashes:
         if not _is_valid_hash(h):
             raise ValueError(f"invalid hash: {h!r}")
         if not await repo.store.async_exists(h):
             missing.append(h)
-    return {"missing": missing}
+
+    scope_path = scope.get("path", "")
+    if scope_path:
+        server_head = await repo.async_get_scope_head_commit_id(scope_path)
+    else:
+        server_head = ""
+    if not server_head:
+        server_head = await repo.async_get_head_commit_id()
+
+    recognised = True
+    if req.remote_head:
+        entry = await repo.async_get_history_entry(req.remote_head)
+        recognised = entry is not None
+
+    return NegotiateResponse(
+        missing=missing,
+        server_head_commit_id=server_head,
+        remote_head_recognized=recognised,
+    ).to_dict()
 
 
 async def _handle_rollback(repo: ServerRepo, auth: dict, body: dict) -> dict:
     """Rollback to a historical commit (async wrapper around sync handler)."""
+    require_supported_protocol(body)
     scope = auth["_scope"]
     if scope.get("mode", "r") == "r":
         raise PermissionDenied("scope is read-only")
@@ -296,6 +333,7 @@ async def _handle_rollback(repo: ServerRepo, auth: dict, body: dict) -> dict:
 
 async def _handle_pull_commit(repo: ServerRepo, auth: dict, body: dict) -> dict:
     """Pull files at a specific historical commit."""
+    require_supported_protocol(body)
     from mut.server.handlers import handle_pull_commit
     return await asyncio.to_thread(handle_pull_commit, repo, auth, body)
 
@@ -305,6 +343,7 @@ _handle_pull_version = _handle_pull_commit
 
 
 async def _handle_pull(repo: ServerRepo, auth: dict, body: dict) -> dict:
+    require_supported_protocol(body)
     scope = auth["_scope"]
     since_commit_id = body.get("since_commit_id", "")
     head_commit_id = await repo.async_get_scope_head_commit_id(scope["path"])
@@ -484,10 +523,17 @@ def _validate_scope_paths(scope: dict, scope_prefix: str, files: dict) -> list:
 
 def _resolve_conflicts(repo, scope, base_commit_id, current_head_commit,
                        our_files, their_files):
-    if base_commit_id and current_head_commit and base_commit_id != current_head_commit:
-        base_files = _get_base_files(repo, scope, base_commit_id)
-        return merge_file_sets(base_files, our_files, their_files)
-    return their_files, []
+    """Three-way merge whenever the client's base diverges from server head.
+
+    Kept in sync with :func:`mut.server.handlers._resolve_conflicts` — both
+    paths MUST merge on empty base_commit_id, otherwise server-only files
+    get dropped by the subsequent apply-files step.
+    """
+    if base_commit_id == current_head_commit:
+        return their_files, []
+    base_files = (_get_base_files(repo, scope, base_commit_id)
+                  if base_commit_id else {})
+    return merge_file_sets(base_files, our_files, their_files)
 
 
 async def _async_apply_merged_files(repo, scope, old_scope_files, merged_files):

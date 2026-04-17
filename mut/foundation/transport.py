@@ -19,7 +19,7 @@ import urllib.request
 import urllib.error
 from typing import Optional
 
-from mut.foundation.error import NetworkError
+from mut.foundation.error import ClientTooOldError, NetworkError
 from mut.core.protocol import (
     PushRequest, PullRequest, NegotiateRequest, CloneRequest,
 )
@@ -29,6 +29,7 @@ _DEFAULT_TIMEOUT = int(os.environ.get("MUT_TIMEOUT", "60"))
 _MAX_RETRIES = 3
 _RETRY_BACKOFF = 1.0
 _RETRYABLE_CODES = {408, 429, 500, 502, 503, 504}
+_UPGRADE_REQUIRED_CODE = 426
 
 
 def _parse_http_error(e: urllib.error.HTTPError) -> str:
@@ -94,6 +95,13 @@ def _make_request(url: str, data: dict | None = None,
 
 def _raise_as_network_error(e: Exception):
     if isinstance(e, urllib.error.HTTPError):
+        # 426 Upgrade Required is the server's way of saying "your wire
+        # protocol is too old". Surface it as ClientTooOldError rather
+        # than a generic NetworkError so CLI-level handlers can print
+        # a specific "run `pip install -U mutai`" hint instead of the
+        # usual "cannot reach server" confusion.
+        if e.code == _UPGRADE_REQUIRED_CODE:
+            raise ClientTooOldError(_parse_http_error(e))
         raise NetworkError(f"server error ({e.code}): {_parse_http_error(e)}")
     if isinstance(e, urllib.error.URLError):
         raise NetworkError(f"cannot reach server: {e.reason}")
@@ -138,8 +146,12 @@ class MutClient:
         )
         return self._post("/push", req.to_dict())
 
-    def negotiate(self, hashes: list[str]) -> dict:
-        req = NegotiateRequest(hashes=hashes)
+    def negotiate(self, hashes: list[str] | None = None,
+                  remote_head: str = "") -> dict:
+        req = NegotiateRequest(
+            hashes=list(hashes) if hashes else [],
+            remote_head=remote_head,
+        )
         return self._post("/negotiate", req.to_dict())
 
     def pull(self, since_commit_id: str,
@@ -193,8 +205,12 @@ class AsyncMutClient:
         )
         return await self._post("/push", req.to_dict())
 
-    async def negotiate(self, hashes: list[str]) -> dict:
-        req = NegotiateRequest(hashes=hashes)
+    async def negotiate(self, hashes: list[str] | None = None,
+                        remote_head: str = "") -> dict:
+        req = NegotiateRequest(
+            hashes=list(hashes) if hashes else [],
+            remote_head=remote_head,
+        )
         return await self._post("/negotiate", req.to_dict())
 
     async def pull(self, since_commit_id: str,

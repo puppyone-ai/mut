@@ -70,16 +70,19 @@ def push(repo: MutRepo) -> dict:
 
     server_commit_id = resp.get("commit_id", base_commit_id)
     latest_id = unpushed[-1]["id"]
-    repo.snapshots.mark_pushed(latest_id, server_commit_id=server_commit_id)
-
     merged = resp.get("merged", False)
 
-    # On fast-forward: server commit matches what we built locally — safe to
-    # advance REMOTE_HEAD. On server-side merge: our local tree is stale,
-    # so we keep REMOTE_HEAD at base and let the next pull reconcile.
+    # Fast-forward: local snapshot content equals server commit content,
+    # so stamping server_commit_id onto local snapshots is accurate.
+    # Merged: local content and server commit content DIFFER, so we
+    # only flip the pushed flag. The next pull will create a fresh
+    # local snapshot tagged with the merged commit id.
     if merged:
+        repo.snapshots.mark_pushed(latest_id)
+        # Keep REMOTE_HEAD at base so the follow-up pull can reconcile.
         write_text(remote_head_path, base_commit_id)
     else:
+        repo.snapshots.mark_pushed(latest_id, server_commit_id=server_commit_id)
         write_text(remote_head_path, server_commit_id)
 
     result: dict = {

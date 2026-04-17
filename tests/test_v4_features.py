@@ -7,7 +7,7 @@ import json
 import pytest
 
 from mut.server.repo import ServerRepo
-from mut.server.server import (
+from tests._handlers_shim import (
     _handle_push, _handle_pull_commit, _handle_clone,
 )
 from mut.foundation.config import load_env, get_client_credential

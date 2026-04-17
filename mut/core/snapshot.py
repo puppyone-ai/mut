@@ -175,6 +175,39 @@ class SnapshotChain:
                 self._write_snap(snap)
         write_text(self.dir / "pushed", str(up_to_id))
 
+    def reset_pushed_watermark(self) -> int:
+        """Clear the "already pushed" flag on every local snapshot so that
+        the next push re-uploads them.
+
+        Used when the server reports it no longer recognizes our
+        ``REMOTE_HEAD`` (history truncated, restored from older backup,
+        or manually wiped) — the local watermark was lying about what
+        the server actually has, so we drop it and let push rebuild
+        from scratch (see Bug #6 / ``docs/design/mut-git-alignment.md``).
+
+        Snapshots that were pulled from the server (``who == "pull"`` and
+        carrying a non-empty ``server_commit_id``) are left alone: their
+        data came from the server and re-pushing them as fresh commits
+        would be semantically wrong.
+
+        Returns the number of snapshots whose ``pushed`` flag was cleared.
+        """
+        self._ensure_migrated()
+        latest = self._get_latest_id()
+        cleared = 0
+        for i in range(1, latest + 1):
+            snap = self._read_snap(i)
+            if not snap or not snap.get("pushed"):
+                continue
+            if snap.get("who") == "pull" and snap.get("server_commit_id"):
+                continue
+            snap["pushed"] = False
+            snap["server_commit_id"] = ""
+            self._write_snap(snap)
+            cleared += 1
+        write_text(self.dir / "pushed", "0")
+        return cleared
+
     def count(self) -> int:
         self._ensure_migrated()
         return self._get_latest_id()
