@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mutai"
-version = "0.1.5"
+version = "0.1.6"
 description = "Managed Unified Tree — version management for AI agents"
 requires-python = ">=3.9"
 license = "MIT"

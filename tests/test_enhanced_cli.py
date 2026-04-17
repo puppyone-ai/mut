@@ -63,8 +63,9 @@ class TestMutStatus:
 
         captured = capsys.readouterr()
         assert "api.puppyone.com" in captured.out
-        # cli truncates commit ids to 8 hex chars for display
-        assert "remote commit: a1b2c3d4" in captured.out
+        # cli displays the full 16-hex commit id (no Git-style truncation —
+        # 16 hex is short enough already)
+        assert "remote commit: a1b2c3d4e5f60718" in captured.out
 
     def test_status_shows_unpushed_count(self, workspace):
         repo = MutRepo(str(workspace))

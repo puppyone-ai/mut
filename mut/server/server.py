@@ -601,10 +601,10 @@ def _get_base_files(repo, scope, base_commit_id) -> dict:
                         for path, h in flat_hashes.items()}
     except (KeyError, json.JSONDecodeError) as exc:
         print(f"[mut-server] warning: failed to read base "
-              f"#{base_commit_id[:8]}: {exc}")
+              f"#{base_commit_id}: {exc}")
     except ObjectNotFoundError as exc:
         print(f"[mut-server] warning: missing object for base "
-              f"#{base_commit_id[:8]}: {exc}")
+              f"#{base_commit_id}: {exc}")
     return {}
 
 
@@ -658,7 +658,7 @@ async def async_serve(repo_root: str, host: str = "127.0.0.1",
     print(f"Mut server listening on http://{host}:{port}")
     print(f"  repo: {repo.root}")
     print(f"  auth: {auth_name}")
-    print(f"  head: #{head[:8] if head != '(empty)' else head}")
+    print(f"  head: #{head}")
 
     try:
         async with server:

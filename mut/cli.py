@@ -146,7 +146,7 @@ def cmd_status(args):
         print(f"  access point: {server}")
     print(f"  local snapshot: #{result['local_snapshot_id']}")
     if result["remote_commit_id"]:
-        print(f"  remote commit: {result['remote_commit_id'][:8]}")
+        print(f"  remote commit: {result['remote_commit_id']}")
 
     if not changes:
         print("  clean — no changes since last snapshot")
@@ -249,7 +249,7 @@ def cmd_push(args):
         print(f"Pushed {result['pushed']} snapshot(s)")
         server_cid = result.get("server_commit_id")
         if server_cid:
-            print(f"  server commit: {server_cid[:8]}")
+            print(f"  server commit: {server_cid}")
         if result.get("merged"):
             print(f"  auto-merged ({result.get('conflicts', 0)} "
                   "conflict(s) resolved)")
@@ -286,7 +286,7 @@ def cmd_pull(args):
         print(f"Pulled {result['pulled']} file(s) from server")
         server_cid = result.get("server_commit_id")
         if server_cid:
-            print(f"  server commit: {server_cid[:8]}")
+            print(f"  server commit: {server_cid}")
 
 
 def cmd_rollback(args):
@@ -295,13 +295,13 @@ def cmd_rollback(args):
     if _output(result, _json_flag(args)):
         return
     if result["status"] == "already-at-commit":
-        print(f"Already at commit {args.commit_id[:8]}")
+        print(f"Already at commit {args.commit_id}")
     else:
         target = result.get("target_commit_id", args.commit_id)
         new_cid = result.get("new_commit_id", "")
-        print(f"Rolled back to #{target[:8]}")
+        print(f"Rolled back to {target}")
         if new_cid:
-            print(f"  new server commit: #{new_cid[:8]}")
+            print(f"  new server commit: {new_cid}")
         changes = result.get("changes", [])
         if changes:
             print(f"  {len(changes)} file(s) changed")
@@ -363,7 +363,7 @@ def cmd_link(args):
     print(f"Linked to {result['server']}")
     server_cid = result.get("server_commit_id", "")
     if server_cid:
-        print(f"  server commit: {server_cid[:8]}")
+        print(f"  server commit: {server_cid}")
     if result.get("scope_created"):
         print(f"  created scope directory: {args.dir_name}/")
     if result.get("scope_push_error"):

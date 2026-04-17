@@ -82,9 +82,9 @@ def pull(repo: MutRepo, force: bool = False) -> dict:
 
     root_hash = tree_mod.scan_dir(repo.store, repo.workdir, repo.ignore)
 
-    short = head_commit_id[:8] if head_commit_id else "(empty)"
+    label = head_commit_id if head_commit_id else "(empty)"
     repo.snapshots.create(root_hash, "pull",
-                          f"pulled from server (#{short})",
+                          f"pulled from server (#{label})",
                           pushed=True,
                           server_commit_id=head_commit_id)
 

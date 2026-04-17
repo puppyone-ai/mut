@@ -450,7 +450,7 @@ def _rollback_cas_attempt(
 
     repo.record_history(
         new_commit_id, auth["agent"],
-        f"rollback to #{target_commit_id[:8]}",
+        f"rollback to #{target_commit_id}",
         scope["path"], changes,
         scope_hash=new_scope_hash,
         created_at_iso=created_at_iso,
@@ -585,8 +585,8 @@ def _get_base_files(repo, scope, base_commit_id):
                 return _flatten_tree_to_bytes(repo.store, subtree_hash)
     except (KeyError, json.JSONDecodeError) as exc:
         print(f"[mut-server] warning: failed to read base "
-              f"#{base_commit_id[:8]}: {exc}")
+              f"#{base_commit_id}: {exc}")
     except ObjectNotFoundError as exc:
         print(f"[mut-server] warning: missing object for base "
-              f"#{base_commit_id[:8]}: {exc}")
+              f"#{base_commit_id}: {exc}")
     return {}
