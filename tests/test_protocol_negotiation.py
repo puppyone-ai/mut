@@ -249,3 +249,209 @@ class TestResetPushedWatermark:
         assert cleared == 0
         # still unpushed
         assert [s["id"] for s in chain.get_unpushed()] == [1]
+
+
+# ---------------------------------------------------------------------------
+# Bug #6 — push reconcile flow (integration: _reconcile_with_server + push)
+# ---------------------------------------------------------------------------
+
+
+class _FakeClient:
+    """Mock MutClient that records calls and lets each test stage a
+    canned ``negotiate()`` response.
+
+    We deliberately do not exercise the real HTTP layer here — that
+    surface is covered in ``test_handlers.py`` and the dedicated probe
+    tests above. The goal here is to prove that ``push()`` calls
+    ``_reconcile_with_server`` first, and that an "unrecognized"
+    response triggers ``reset_pushed_watermark`` + REMOTE_HEAD rewrite.
+    """
+
+    def __init__(self, negotiate_resp: dict, push_resp: dict | None = None):
+        self.negotiate_resp = negotiate_resp
+        self.push_resp = push_resp or {}
+        self.negotiate_calls: list[dict] = []
+        self.push_calls: list[dict] = []
+
+    def negotiate(self, hashes=None, remote_head: str = ""):
+        self.negotiate_calls.append({
+            "hashes": list(hashes) if hashes else [],
+            "remote_head": remote_head,
+        })
+        return dict(self.negotiate_resp)
+
+    def push(self, base_commit_id, snap_data, objects):
+        self.push_calls.append({
+            "base_commit_id": base_commit_id,
+            "snap_count": len(snap_data),
+            "object_count": len(objects),
+        })
+        return dict(self.push_resp)
+
+
+def _setup_local_repo(tmp_path):
+    """Initialise a local MutRepo with two pushed snapshots and a
+    populated REMOTE_HEAD — the same shape as a "post-truncation
+    client" before reconciliation."""
+    from mut.ops import init_op
+    from mut.foundation.fs import write_text
+    from mut.foundation.config import REMOTE_HEAD_FILE
+
+    workdir = tmp_path / "wd"
+    workdir.mkdir()
+    repo = init_op.init(str(workdir))
+    repo.snapshots.create("r1", "agent-A", "first", pushed=True)
+    repo.snapshots.create("r2", "agent-A", "second", pushed=True)
+    write_text(repo.mut_root / REMOTE_HEAD_FILE, "stale_head_xxxxx")
+    return repo
+
+
+class TestPushReconcile:
+    def test_self_heals_when_server_lost_history(self, tmp_path):
+        """Server reports our REMOTE_HEAD is unknown ⇒ reset watermark
+        and adopt the server's actual head."""
+        from mut.ops.push_op import _reconcile_with_server
+        from mut.foundation.config import REMOTE_HEAD_FILE
+        from mut.foundation.fs import read_text
+
+        repo = _setup_local_repo(tmp_path)
+        client = _FakeClient(negotiate_resp={
+            "protocol_version": PROTOCOL_VERSION,
+            "missing": [],
+            "server_head_commit_id": "freshhead0000abc",
+            "remote_head_recognized": False,
+        })
+
+        info = _reconcile_with_server(
+            repo, client, repo.mut_root / REMOTE_HEAD_FILE,
+        )
+
+        assert info["reset"] == 2  # both pushed snapshots cleared
+        assert info["server_head"] == "freshhead0000abc"
+        assert info["recognized"] is False
+        # REMOTE_HEAD adopts the server's truth.
+        head = read_text(repo.mut_root / REMOTE_HEAD_FILE).strip()
+        assert head == "freshhead0000abc"
+        # Watermark file reset → unpushed re-emerges.
+        unpushed = repo.snapshots.get_unpushed()
+        assert {s["id"] for s in unpushed} == {1, 2}
+        # Negotiate was called with the original local REMOTE_HEAD.
+        assert client.negotiate_calls == [{
+            "hashes": [], "remote_head": "stale_head_xxxxx",
+        }]
+
+    def test_no_reset_when_server_recognises_remote_head(self, tmp_path):
+        from mut.ops.push_op import _reconcile_with_server
+        from mut.foundation.config import REMOTE_HEAD_FILE
+        from mut.foundation.fs import read_text
+
+        repo = _setup_local_repo(tmp_path)
+        client = _FakeClient(negotiate_resp={
+            "protocol_version": PROTOCOL_VERSION,
+            "missing": [],
+            "server_head_commit_id": "stale_head_xxxxx",
+            "remote_head_recognized": True,
+        })
+
+        info = _reconcile_with_server(
+            repo, client, repo.mut_root / REMOTE_HEAD_FILE,
+        )
+
+        assert info["reset"] == 0
+        # REMOTE_HEAD is left untouched on the happy path.
+        head = read_text(repo.mut_root / REMOTE_HEAD_FILE).strip()
+        assert head == "stale_head_xxxxx"
+        # Snapshots stay pushed → nothing to re-upload.
+        assert repo.snapshots.get_unpushed() == []
+
+    def test_no_reset_when_local_remote_head_is_empty(self, tmp_path):
+        """A brand-new clone has REMOTE_HEAD="" — even if the server
+        replies recognized=False (it can't recognise an empty ref) we
+        must NOT clobber state."""
+        from mut.ops.push_op import _reconcile_with_server
+        from mut.foundation.config import REMOTE_HEAD_FILE
+        from mut.ops import init_op
+
+        workdir = tmp_path / "wd"
+        workdir.mkdir()
+        repo = init_op.init(str(workdir))
+        repo.snapshots.create("r1", "agent-A", "first", pushed=True)
+        # NB: REMOTE_HEAD file is missing entirely (fresh init).
+        client = _FakeClient(negotiate_resp={
+            "protocol_version": PROTOCOL_VERSION,
+            "missing": [],
+            "server_head_commit_id": "anything0000abcd",
+            "remote_head_recognized": False,  # vacuously false
+        })
+
+        info = _reconcile_with_server(
+            repo, client, repo.mut_root / REMOTE_HEAD_FILE,
+        )
+
+        assert info["reset"] == 0
+        # No watermark damage on fresh repos.
+        assert repo.snapshots.get_unpushed() == []
+
+    def test_full_push_surfaces_watermark_reset_in_result(
+            self, tmp_path, monkeypatch):
+        """End-to-end push() must thread reconcile_info["reset"] into
+        the user-facing result dict so the CLI can show the note."""
+        import mut.ops.push_op as push_op_mod
+        from mut.foundation.config import save_config
+        from mut.foundation.fs import write_text
+        from mut.ops import init_op
+
+        # Build a minimal repo with one real tree object so the push
+        # flow can walk reachable hashes without exploding.
+        workdir = tmp_path / "wd"
+        workdir.mkdir()
+        repo = init_op.init(str(workdir))
+        # Use opaque (non-tree-shaped) bytes — push() will call into
+        # tree_mod.collect_reachable_hashes which we stub below.
+        root_a = repo.store.put(b'opaque_a')
+        root_b = repo.store.put(b'opaque_b')
+        repo.snapshots.create(root_a, "agent-A", "first", pushed=True)
+        repo.snapshots.create(root_b, "agent-A", "second", pushed=True)
+        from mut.foundation.config import REMOTE_HEAD_FILE
+        write_text(repo.mut_root / REMOTE_HEAD_FILE, "stale_head_xxxxx")
+
+        save_config(repo.mut_root, {"server": "http://fake-server"})
+        cred_path = repo.mut_root / "credential"
+        write_text(cred_path, "fake-credential")
+        cred_path.chmod(0o600)
+
+        client = _FakeClient(
+            negotiate_resp={
+                "protocol_version": PROTOCOL_VERSION,
+                "missing": [],
+                "server_head_commit_id": "freshhead0000abc",
+                "remote_head_recognized": False,
+            },
+            push_resp={
+                "commit_id": "newcommit0000abc",
+                "merged": False,
+            },
+        )
+        monkeypatch.setattr(push_op_mod, "MutClient",
+                            lambda *a, **kw: client)
+        # Stub tree-walking — we control the snapshot roots above.
+        monkeypatch.setattr(
+            push_op_mod.tree_mod, "collect_reachable_hashes",
+            lambda store, h: {h},
+        )
+
+        result = push_op_mod.push(repo)
+
+        assert result["status"] == "pushed"
+        assert result["pushed"] == 2
+        assert result["watermark_reset"] == 2
+        assert result["server_commit_id"] == "newcommit0000abc"
+        # Two negotiates: reconcile probe + object availability probe.
+        assert len(client.negotiate_calls) == 2
+        assert client.negotiate_calls[0]["remote_head"] == "stale_head_xxxxx"
+        assert client.negotiate_calls[0]["hashes"] == []
+        probed_hashes = set(client.negotiate_calls[1]["hashes"])
+        assert {root_a, root_b}.issubset(probed_hashes)
+        assert len(client.push_calls) == 1
+        # After a successful push the watermark advances again.
+        assert repo.snapshots.get_unpushed() == []

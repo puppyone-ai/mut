@@ -1,9 +1,10 @@
 """mut push — Push unpushed local snapshots to the server.
 
-1. Find unpushed snapshots
-2. Collect new objects that server might not have
-3. POST /push with objects + snapshots
-4. Update REMOTE_HEAD + mark pushed
+1. Reconcile REMOTE_HEAD with the server (Bug #6 self-heal)
+2. Find unpushed snapshots (rebuilt from id 1 if the server lost history)
+3. Collect new objects that the server might not have
+4. POST /push with objects + snapshots
+5. Update REMOTE_HEAD + mark pushed
 """
 
 from __future__ import annotations
@@ -15,6 +16,43 @@ from mut.foundation.transport import MutClient
 from mut.core import manifest as manifest_mod
 from mut.core import tree as tree_mod
 from mut.core.diff import diff_manifests
+from mut.core.protocol import NegotiateResponse
+
+
+def _reconcile_with_server(repo: MutRepo, client: MutClient,
+                           remote_head_path) -> dict:
+    """Ask the server whether our local ``REMOTE_HEAD`` still exists in
+    history and realign local state when it doesn't.
+
+    This is the Git-style "reference discovery" step — per
+    ``docs/design/mut-git-alignment.md``, the client must treat the
+    server's current head as the single source of truth about what's
+    been pushed. A non-empty local REMOTE_HEAD that the server can't
+    find means the server was truncated / restored / manually cleaned,
+    and the local "pushed" watermark is lying. In that case we reset
+    the watermark, write the server's actual head back to REMOTE_HEAD,
+    and let ``get_unpushed()`` surface every local commit again.
+
+    Returns a dict with diagnostic info (``reset`` — number of
+    snapshots whose pushed flag was cleared; ``server_head`` — the
+    server's current head after reconciliation).
+    """
+    local_remote_head = (read_text(remote_head_path).strip()
+                         if remote_head_path.exists() else "")
+
+    probe = client.negotiate(hashes=[], remote_head=local_remote_head)
+    resp = NegotiateResponse.from_dict(probe)
+
+    info = {
+        "reset": 0,
+        "server_head": resp.server_head_commit_id,
+        "recognized": resp.remote_head_recognized,
+    }
+
+    if local_remote_head and not resp.remote_head_recognized:
+        info["reset"] = repo.snapshots.reset_pushed_watermark()
+        write_text(remote_head_path, resp.server_head_commit_id)
+    return info
 
 
 def push(repo: MutRepo) -> dict:
@@ -28,6 +66,9 @@ def push(repo: MutRepo) -> dict:
 
     credential, user_identity = get_client_credential(repo.mut_root, repo.workdir)
     client = MutClient(server_url, credential, user_identity=user_identity)
+    remote_head_path = repo.mut_root / REMOTE_HEAD_FILE
+
+    reconcile_info = _reconcile_with_server(repo, client, remote_head_path)
 
     unpushed = repo.snapshots.get_unpushed()
     if not unpushed:
@@ -40,9 +81,11 @@ def push(repo: MutRepo) -> dict:
                 "pushed": 0,
                 "uncommitted": len(dirty),
             }
-        return {"status": "up-to-date", "pushed": 0}
+        result: dict = {"status": "up-to-date", "pushed": 0}
+        if reconcile_info["reset"]:
+            result["watermark_reset"] = reconcile_info["reset"]
+        return result
 
-    remote_head_path = repo.mut_root / REMOTE_HEAD_FILE
     base_commit_id = (read_text(remote_head_path).strip()
                       if remote_head_path.exists() else "")
 
@@ -79,7 +122,6 @@ def push(repo: MutRepo) -> dict:
     # local snapshot tagged with the merged commit id.
     if merged:
         repo.snapshots.mark_pushed(latest_id)
-        # Keep REMOTE_HEAD at base so the follow-up pull can reconcile.
         write_text(remote_head_path, base_commit_id)
     else:
         repo.snapshots.mark_pushed(latest_id, server_commit_id=server_commit_id)
@@ -94,6 +136,8 @@ def push(repo: MutRepo) -> dict:
     if merged:
         result["merged"] = True
         result["conflicts"] = resp.get("conflicts", 0)
+    if reconcile_info["reset"]:
+        result["watermark_reset"] = reconcile_info["reset"]
     return result
 
 
@@ -104,7 +148,6 @@ def _local_push(repo: MutRepo) -> dict:
 
     latest = unpushed[-1]
     repo.snapshots.mark_pushed(latest["id"])
-    # Local-only mode: no server commit_id exists; clear REMOTE_HEAD.
     write_text(repo.mut_root / REMOTE_HEAD_FILE, "")
 
     return {

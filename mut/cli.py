@@ -23,7 +23,7 @@ import argparse
 import json
 import sys
 
-from mut.foundation.error import MutError, NetworkError
+from mut.foundation.error import ClientTooOldError, MutError, NetworkError
 from mut.ops.repo import MutRepo
 from mut.ops import (
     init_op,
@@ -224,6 +224,9 @@ def cmd_push(args):
     repo = MutRepo(".")
     try:
         result = push_op.push(repo)
+    except ClientTooOldError as e:
+        print(f"fatal: {e}", file=sys.stderr)
+        sys.exit(1)
     except NetworkError:
         print("fatal: push failed — cannot reach server.", file=sys.stderr)
         print("  Check your network connection and server URL.", file=sys.stderr)
@@ -231,6 +234,10 @@ def cmd_push(args):
         sys.exit(1)
     if _output(result, _json_flag(args)):
         return
+    reset_n = result.get("watermark_reset", 0)
+    if reset_n:
+        print(f"note: server no longer recognized REMOTE_HEAD — "
+              f"reset {reset_n} pushed flag(s) for re-upload")
     if result["status"] == "dirty":
         print(f"You have {result['uncommitted']} uncommitted change(s).")
         print("  Run 'mut commit -m \"...\"' first, then push.")
@@ -254,6 +261,9 @@ def cmd_pull(args):
     repo = MutRepo(".")
     try:
         result = pull_op.pull(repo, force=args.force)
+    except ClientTooOldError as e:
+        print(f"fatal: {e}", file=sys.stderr)
+        sys.exit(1)
     except NetworkError:
         print("fatal: pull failed — cannot reach server.", file=sys.stderr)
         print("  Check your network connection and try again: mut pull",
