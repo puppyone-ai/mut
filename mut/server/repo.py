@@ -358,6 +358,20 @@ class ServerRepo:
             self.set_scope_head_commit_id(scope_path, head_commit_id)
         return True
 
+    def cas_update_root_hash(self, old_root: str, new_root: str) -> bool:
+        """Atomic CAS on root_hash. Returns True if successful.
+
+        The default (filesystem) implementation is single-process so a
+        simple read-compare-write is safe. Multi-process backends
+        (e.g. PuppyOne + Postgres) override this with a real atomic
+        UPDATE ... WHERE root_hash = old_root.
+        """
+        current = self.get_root_hash()
+        if current != old_root:
+            return False
+        self.set_root_hash(new_root)
+        return True
+
 
 def _scope_base(current: Path, scope_path: str) -> Path:
     return current / scope_path if scope_path else current
