@@ -50,8 +50,14 @@ def _secure_file(path: Path):
 
 
 def normalize_path(path: str) -> str:
-    """Strip leading/trailing slashes for consistent path comparison."""
-    return path.strip("/")
+    """Strip leading/trailing slashes for consistent path comparison.
+
+    Rejects paths containing '..' segments to prevent path traversal attacks.
+    """
+    clean = path.strip("/")
+    if clean and ".." in clean.split("/"):
+        raise ValueError(f"path traversal not allowed: {path}")
+    return clean
 
 
 # ── Unified config I/O ───────────────────────

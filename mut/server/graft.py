@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 
 from mut.foundation.config import normalize_path
+from mut.foundation.error import ObjectNotFoundError
 from mut.core.object_store import ObjectStore
 
 
@@ -100,6 +101,32 @@ async def _async_graft_recursive(
     return await store.async_put(json.dumps(entries, sort_keys=True).encode())
 
 
+def graft_subtree_cas(repo, scope_path: str, new_scope_hash: str,
+                      max_retries: int = 3) -> str | None:
+    """Graft scope tree into global root using CAS on root_hash.
+
+    Retries up to ``max_retries`` times on CAS failure (another scope
+    grafted concurrently). Returns the new root hash on success, or
+    None if all retries are exhausted.
+
+    Best-effort: callers should log but not fail the push when this
+    returns None — the scope push already succeeded via
+    ``cas_update_scope``.
+    """
+    import json as _json
+
+    for _attempt in range(max_retries + 1):
+        old_root = repo.get_root_hash() or ""
+        if not old_root:
+            old_root = repo.store.put(_json.dumps({}, sort_keys=True).encode())
+
+        new_root = graft_subtree(repo.store, old_root, scope_path, new_scope_hash)
+        if repo.cas_update_root_hash(old_root, new_root):
+            return new_root
+
+    return None
+
+
 def graft_or_merge_subtree(
     store: ObjectStore, old_root_hash: str,
     scope_path: str, old_scope_hash: str, new_scope_hash: str,
@@ -146,7 +173,7 @@ def _navigate_to_hash(store: ObjectStore, root_hash: str, scope_path: str) -> st
             continue
         try:
             entries = json.loads(store.get(current))
-        except Exception:
+        except (ObjectNotFoundError, KeyError, json.JSONDecodeError):
             return None
         if part not in entries:
             return None

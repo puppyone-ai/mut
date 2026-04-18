@@ -56,6 +56,11 @@ class NetworkError(MutError):
     http_status = 502
 
 
+class StorageWriteError(MutError):
+    """Raised when writing an object to the storage backend fails."""
+    http_status = 502
+
+
 class PayloadTooLargeError(MutError):
     """Raised when request body exceeds the size limit."""
     http_status = 413
