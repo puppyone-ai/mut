@@ -110,9 +110,26 @@ mut-server serve ./my-project --port 9742
 
 **Client — on the machine where your agent runs:**
 
+There are two onboarding flows depending on where the content already lives.
+
+*A. The server already has the content — clone a fresh copy:*
+
 ```bash
 mut clone http://<server-host>:9742 --credential <CREDENTIAL>
 ```
+
+*B. The folder already exists locally — connect it to the server and upload:*
+
+```bash
+cd /path/to/existing/folder
+mut connect http://<server-host>:9742 --credential <CREDENTIAL>
+```
+
+`mut connect` is the local-first counterpart of `mut clone`: it runs
+`init` + `link` + `commit` + `push` in one shot, so an existing folder
+can be attached to an Access Point without manually wiring up the four
+steps. The server runs its standard three-way merge — nothing is
+overwritten silently.
 
 Done. The agent now has a local copy of the context in `my-project/`.
 
@@ -165,6 +182,7 @@ mut checkout <snapshot-id>
 | Command | Description |
 |---|---|
 | `mut clone <url>` | Clone from server (supports invite URLs) |
+| `mut connect <url>` | Attach an existing local folder to an Access Point (init + link + commit + push, in one step) |
 | `mut register <invite-url>` | Register with a server using an invite |
 | `mut status` | Show uncommitted changes |
 | `mut commit -m "msg"` | Snapshot the working directory |

@@ -43,6 +43,7 @@ from mut.ops import (
     cat_op,
     daemon_op,
     link_access_op,
+    connect_op,
 )
 
 
@@ -350,6 +351,12 @@ def cmd_link(args):
               file=sys.stderr)
         sys.exit(1)
 
+    print(
+        "warning: 'mut link access' is deprecated — use 'mut connect <url>' "
+        "to bind a local folder to an Access Point and sync in one step.",
+        file=sys.stderr,
+    )
+
     repo = MutRepo(".")
     result = link_access_op.link_access(
         repo,
@@ -368,6 +375,45 @@ def cmd_link(args):
         print(f"  created scope directory: {args.dir_name}/")
     if result.get("scope_push_error"):
         print(f"  note: scope push skipped ({result['scope_push_error']})")
+
+
+def cmd_connect(args):
+    credential = args.credential or None
+
+    if not credential:
+        from mut.foundation.credentials import get_credential
+        cred = get_credential(args.url)
+        if cred:
+            credential = cred["credential"]
+
+    workdir = args.workdir or "."
+    message = args.message or connect_op.DEFAULT_CONNECT_MESSAGE
+    who = args.who or connect_op.DEFAULT_CONNECT_AUTHOR
+
+    result = connect_op.connect(
+        access_point_url=args.url,
+        credential=credential,
+        workdir=workdir,
+        message=message,
+        who=who,
+    )
+
+    if _output(result, _json_flag(args)):
+        return
+
+    if result["initialized"]:
+        print(f"Initialized empty Mut repository in {workdir}/.mut/")
+    print(f"Connected to {result['server']}")
+    server_cid = result.get("server_commit_id", "")
+    if server_cid:
+        print(f"  server commit: {server_cid}")
+    if result.get("imported"):
+        print(f"  imported existing folder as snapshot #{result['snapshot_id']}: {message}")
+    pushed = result.get("pushed", 0)
+    if pushed:
+        print(f"  pushed {pushed} snapshot(s)")
+    elif not result.get("imported"):
+        print("  workdir empty — no content imported, run 'mut pull' to fetch from server")
 
 
 def main():
@@ -442,8 +488,27 @@ def main():
     p_daemon.add_argument("-w", "--who", default="daemon",
                            help="Author name for auto-commits")
 
-    p_link = sub.add_parser("link",
-                             help="Link repo to a PuppyOne Access Point")
+    p_connect = sub.add_parser(
+        "connect",
+        help=("Connect an existing local folder to a PuppyOne Access Point "
+              "(init + link + commit + push, in one step)"),
+    )
+    p_connect.add_argument("url", help="Access Point URL")
+    p_connect.add_argument("--credential", default="",
+                            help="Auth credential (default: parsed from URL)")
+    p_connect.add_argument("--workdir", default="",
+                            help="Local directory to attach (default: current dir)")
+    p_connect.add_argument("-m", "--message",
+                            default=connect_op.DEFAULT_CONNECT_MESSAGE,
+                            help="Commit message used when importing existing files")
+    p_connect.add_argument("-w", "--who",
+                            default=connect_op.DEFAULT_CONNECT_AUTHOR,
+                            help="Author recorded on the import commit")
+
+    p_link = sub.add_parser(
+        "link",
+        help="[deprecated] use 'mut connect <url>' instead",
+    )
     p_link.add_argument("link_type", metavar="type",
                          help="Link type (currently only 'access')")
     p_link.add_argument("url", help="Access Point URL")
@@ -474,6 +539,7 @@ def main():
         "ls": cmd_ls,
         "cat": cmd_cat,
         "daemon": cmd_daemon,
+        "connect": cmd_connect,
         "link": cmd_link,
     }
 
