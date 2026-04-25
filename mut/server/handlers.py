@@ -141,70 +141,74 @@ def _push_cas_attempt(
     old_scope_hash = repo.get_scope_hash(scope["path"])
     current_head_commit = repo.get_scope_head_commit_id(scope["path"])
 
-    # Fast path: if client's base matches server head and scope hash matches
-    # the client's root, no merge needed — just apply their files directly.
-    if (req.base_commit_id == current_head_commit
-            and old_scope_hash
-            and req.snapshots[-1]["root"] == old_scope_hash):
-        # Nothing changed server-side since client cloned — no merge needed.
-        # Still need content to apply, but only for files the client changed.
-        their_files = _fetch_changed_blobs(repo.store, their_hashes)
-        our_files: dict = {}
-        merged_files, merge_conflicts = their_files, []
+    # ── Fast path: no server changes since client cloned ──────────────
+    # When base matches head, no merge is needed. Their tree IS the new
+    # state — skip blob reads and skip rebuild entirely.
+    if req.base_commit_id == current_head_commit:
+        # No server changes — their tree is the final state.
+        # Compute changeset from hashes (no blob reads needed).
+        our_hashes = _get_scope_hashes(repo, scope, old_scope_hash)
+        changes = _compute_changeset_from_hashes(scope_prefix, our_hashes, their_hashes)
+        merge_conflicts = []
+
+        # Use their root hash directly as the new scope hash — no rebuild.
+        new_scope_hash = req.snapshots[-1]["root"]
+
+        # Write only the changed blobs (new/modified files) to scope store.
+        changed_their = {p: h for p, h in their_hashes.items()
+                         if p not in our_hashes or our_hashes[p] != h}
+        if changed_their:
+            repo.write_scope_files(scope, _fetch_changed_blobs(repo.store, changed_their))
+        # Deletions: tell repo which paths to remove
+        for p in our_hashes:
+            if p not in their_hashes:
+                repo.delete_scope_file(scope, p)
+
+    # ── Merge path: server changed since client's base ─────────────────
     else:
-        # Get server-side hashes (tree walk only — no blob reads yet)
         our_hashes = _get_scope_hashes(repo, scope, old_scope_hash)
 
-        # Identify which paths actually need content:
-        # - paths only in theirs: new files (need their content)
-        # - paths only in ours: deleted by client (need our content for changeset)
-        # - paths in both with DIFFERENT hash: real conflict (need both)
-        # - paths in both with SAME hash: unchanged — skip entirely
+        # Only fetch content for paths that actually differ
         changed_their = {p: h for p, h in their_hashes.items()
                          if p not in our_hashes or our_hashes[p] != h}
         changed_our = {p: h for p, h in our_hashes.items()
                        if p not in their_hashes or their_hashes[p] != h}
 
-        # Fetch content only for changed paths
-        their_files = _fetch_changed_blobs(repo.store, changed_their)
-        our_changed_content = _fetch_changed_blobs(repo.store, changed_our)
+        their_content = _fetch_changed_blobs(repo.store, changed_their)
+        our_content = _fetch_changed_blobs(repo.store, changed_our)
 
-        # Build full file dicts: unchanged paths use a sentinel to avoid reads
-        # _resolve_conflicts only needs content for paths that differ
-        our_files = dict(our_changed_content)
-        # Add unchanged files from server (same hash → same content as theirs)
-        for p, h in our_hashes.items():
-            if p in their_hashes and their_hashes[p] == h:
-                # Unchanged: use their version (identical content)
-                our_files[p] = their_files.get(p) or repo.store.get(h)
-
-        # Populate their_files with all their content (changed + unchanged)
+        # Build full dicts: unchanged paths share the same content
+        their_files = dict(their_content)
+        our_files = dict(our_content)
         for p, h in their_hashes.items():
             if p not in their_files:
                 their_files[p] = repo.store.get(h)
+        for p, h in our_hashes.items():
+            if p not in our_files:
+                our_files[p] = their_files.get(p, repo.store.get(h))
 
         merged_files, merge_conflicts = _resolve_conflicts(
             repo, scope, req.base_commit_id, current_head_commit,
             our_files, their_files,
         )
 
-    if merge_conflicts:
-        repo.record_audit("merge_conflict", auth["agent"], {
-            "scope": scope["path"],
-            "base_commit_id": req.base_commit_id,
-            "server_commit_id": current_head_commit,
-            "attempt": attempt,
-            "conflicts": [
-                {"path": c.path, "strategy": c.strategy,
-                 "detail": c.detail, "kept": c.kept,
-                 "lost_content": c.lost_content, "lost_hash": c.lost_hash}
-                for c in merge_conflicts
-            ],
-        })
+        if merge_conflicts:
+            repo.record_audit("merge_conflict", auth["agent"], {
+                "scope": scope["path"],
+                "base_commit_id": req.base_commit_id,
+                "server_commit_id": current_head_commit,
+                "attempt": attempt,
+                "conflicts": [
+                    {"path": c.path, "strategy": c.strategy,
+                     "detail": c.detail, "kept": c.kept,
+                     "lost_content": c.lost_content, "lost_hash": c.lost_hash}
+                    for c in merge_conflicts
+                ],
+            })
 
-    _apply_merged_files(repo, scope, our_files, merged_files)
-
-    new_scope_hash = repo.build_scope_tree(scope)
+        _apply_merged_files(repo, scope, our_files, merged_files)
+        changes = _compute_changeset(scope_prefix, our_files, merged_files)
+        new_scope_hash = repo.build_scope_tree(scope)
 
     # Compute commit_id BEFORE the CAS so the atomic swap can write
     # both ``scope_hash`` and ``head_commit_id`` in a single DB
@@ -224,8 +228,14 @@ def _push_cas_attempt(
     ):
         return None
 
-    changes = _compute_changeset(scope_prefix, our_files, merged_files)
-    merged_changes = _compute_merged_changes(our_files, merged_files, their_files, scope_prefix)
+    # In the fast path changes were already computed from hashes above.
+    # In the merge path they were computed inside the else block.
+    # merged_changes only makes sense in the merge path.
+    if req.base_commit_id != current_head_commit:
+        changes = _compute_changeset(scope_prefix, our_files, merged_files)
+        merged_changes = _compute_merged_changes(our_files, merged_files, their_files, scope_prefix)
+    else:
+        merged_changes = []
 
     repo.record_history(
         new_commit_id, auth["agent"], req.snapshots[-1].get("message", ""),
@@ -595,6 +605,22 @@ def _compute_merged_changes(our_files, merged_files, their_files, scope_prefix):
                 full = f"{scope_prefix}/{rel_path}" if scope_prefix else rel_path
                 merged_changes.append({"path": full, "action": "content_merged"})
     return merged_changes
+
+
+def _compute_changeset_from_hashes(scope_prefix, old_hashes, new_hashes):
+    """Compute changeset from hash dicts — no blob content needed."""
+    changes = []
+    for path in new_hashes:
+        full = f"{scope_prefix}/{path}" if scope_prefix else path
+        if path not in old_hashes:
+            changes.append({"path": full, "action": "add"})
+        elif old_hashes[path] != new_hashes[path]:
+            changes.append({"path": full, "action": "update"})
+    for path in old_hashes:
+        if path not in new_hashes:
+            full = f"{scope_prefix}/{path}" if scope_prefix else path
+            changes.append({"path": full, "action": "delete"})
+    return changes
 
 
 def _flatten_tree_to_bytes(store, tree_hash):
