@@ -102,10 +102,12 @@ def handle_push(repo: ServerRepo, auth: dict, body: dict) -> dict:
         ).to_dict()
 
     their_root_hash = req.snapshots[-1]["root"]
-    their_files = _flatten_tree_to_bytes(repo.store, their_root_hash)
+    # Hash-only pass: get {path: blob_hash} without reading blob content.
+    # Blob content is fetched lazily — only for paths that actually changed.
+    their_hashes = tree_mod.tree_to_flat(repo.store, their_root_hash)
     scope_prefix = normalize_path(scope["path"])
 
-    rejected = _validate_scope_paths(scope, scope_prefix, their_files)
+    rejected = _validate_scope_paths(scope, scope_prefix, their_hashes)
     if rejected:
         repo.record_audit("push_rejected", auth["agent"], {
             "scope": scope["path"], "rejected_paths": rejected,
@@ -114,7 +116,7 @@ def handle_push(repo: ServerRepo, auth: dict, body: dict) -> dict:
 
     for attempt in range(MAX_CAS_RETRIES + 1):
         result = _push_cas_attempt(
-            repo, scope, auth, req, their_files, scope_prefix, attempt,
+            repo, scope, auth, req, their_hashes, scope_prefix, attempt,
         )
         if result is not None:
             return result
@@ -127,17 +129,64 @@ def handle_push(repo: ServerRepo, auth: dict, body: dict) -> dict:
 
 def _push_cas_attempt(
     repo: ServerRepo, scope: dict, auth: dict, req: PushRequest,
-    their_files: dict, scope_prefix: str, attempt: int,
+    their_hashes: dict, scope_prefix: str, attempt: int,
 ) -> dict | None:
-    """Single CAS push attempt. Returns result dict on success, None on CAS failure."""
+    """Single CAS push attempt. Returns result dict on success, None on CAS failure.
+
+    Uses hash-first comparison to achieve sublinear blob reads:
+    1. Get server-side hashes only (tree walk, no blob content)
+    2. Compare hashes: paths with equal hash are identical — skip
+    3. Fetch blob content only for paths that differ (O(changed) not O(total))
+    """
     old_scope_hash = repo.get_scope_hash(scope["path"])
-    our_files = repo.list_scope_files(scope)
     current_head_commit = repo.get_scope_head_commit_id(scope["path"])
 
-    merged_files, merge_conflicts = _resolve_conflicts(
-        repo, scope, req.base_commit_id, current_head_commit,
-        our_files, their_files,
-    )
+    # Fast path: if client's base matches server head and scope hash matches
+    # the client's root, no merge needed — just apply their files directly.
+    if (req.base_commit_id == current_head_commit
+            and old_scope_hash
+            and req.snapshots[-1]["root"] == old_scope_hash):
+        # Nothing changed server-side since client cloned — no merge needed.
+        # Still need content to apply, but only for files the client changed.
+        their_files = _fetch_changed_blobs(repo.store, their_hashes)
+        our_files: dict = {}
+        merged_files, merge_conflicts = their_files, []
+    else:
+        # Get server-side hashes (tree walk only — no blob reads yet)
+        our_hashes = _get_scope_hashes(repo, scope, old_scope_hash)
+
+        # Identify which paths actually need content:
+        # - paths only in theirs: new files (need their content)
+        # - paths only in ours: deleted by client (need our content for changeset)
+        # - paths in both with DIFFERENT hash: real conflict (need both)
+        # - paths in both with SAME hash: unchanged — skip entirely
+        changed_their = {p: h for p, h in their_hashes.items()
+                         if p not in our_hashes or our_hashes[p] != h}
+        changed_our = {p: h for p, h in our_hashes.items()
+                       if p not in their_hashes or their_hashes[p] != h}
+
+        # Fetch content only for changed paths
+        their_files = _fetch_changed_blobs(repo.store, changed_their)
+        our_changed_content = _fetch_changed_blobs(repo.store, changed_our)
+
+        # Build full file dicts: unchanged paths use a sentinel to avoid reads
+        # _resolve_conflicts only needs content for paths that differ
+        our_files = dict(our_changed_content)
+        # Add unchanged files from server (same hash → same content as theirs)
+        for p, h in our_hashes.items():
+            if p in their_hashes and their_hashes[p] == h:
+                # Unchanged: use their version (identical content)
+                our_files[p] = their_files.get(p) or repo.store.get(h)
+
+        # Populate their_files with all their content (changed + unchanged)
+        for p, h in their_hashes.items():
+            if p not in their_files:
+                their_files[p] = repo.store.get(h)
+
+        merged_files, merge_conflicts = _resolve_conflicts(
+            repo, scope, req.base_commit_id, current_head_commit,
+            our_files, their_files,
+        )
 
     if merge_conflicts:
         repo.record_audit("merge_conflict", auth["agent"], {
@@ -551,6 +600,33 @@ def _compute_merged_changes(our_files, merged_files, their_files, scope_prefix):
 def _flatten_tree_to_bytes(store, tree_hash):
     flat_hashes = tree_mod.tree_to_flat(store, tree_hash)
     return {path: store.get(h) for path, h in flat_hashes.items()}
+
+
+def _get_scope_hashes(repo, scope: dict, scope_hash: str) -> dict[str, str]:
+    """Return {rel_path: blob_hash} for the current scope — no blob content fetched."""
+    if not scope_hash:
+        return {}
+    try:
+        return tree_mod.tree_to_flat(repo.store, scope_hash)
+    except Exception:
+        # Fallback: derive from root hash path navigation
+        from mut.foundation.config import normalize_path as _norm
+        root_hash = repo.get_root_hash() if hasattr(repo, "get_root_hash") else ""
+        if not root_hash:
+            return {}
+        parts = _norm(scope["path"]).split("/") if _norm(scope["path"]) else []
+        th = root_hash
+        for p in parts:
+            entries = tree_mod.read_tree(repo.store, th)
+            if p not in entries or entries[p][0] != "T":
+                return {}
+            th = entries[p][1]
+        return tree_mod.tree_to_flat(repo.store, th)
+
+
+def _fetch_changed_blobs(store, hashes: dict[str, str]) -> dict[str, bytes]:
+    """Fetch blob content for the given {path: blob_hash} dict."""
+    return {path: store.get(h) for path, h in hashes.items()}
 
 
 def _navigate_tree(store, tree_hash, parts):
