@@ -251,7 +251,7 @@ def _push_cas_attempt(
         "snapshots": len(req.snapshots),
         "commit_id": new_commit_id,
         "scope_hash": new_scope_hash,
-        "merged": bool(merge_conflicts),
+        "merged": bool(merge_conflicts) or req.base_commit_id != current_head_commit,
         "conflict_count": len(merge_conflicts),
         "cas_attempts": attempt + 1,
     })
@@ -261,7 +261,7 @@ def _push_cas_attempt(
         commit_id=new_commit_id,
         pushed=len(req.snapshots),
         root=new_scope_hash,
-        merged=bool(merge_conflicts),
+        merged=bool(merge_conflicts) or req.base_commit_id != current_head_commit,
         conflicts=len(merge_conflicts),
         merged_changes=merged_changes,
     ).to_dict()
